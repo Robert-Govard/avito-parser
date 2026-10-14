@@ -1,9 +1,10 @@
 """Calm Avito catalog client shared by every search.
 
 Pace and recovery follow what was measured on a home IP: ~30 s between
-requests, PoW (HTTP 439) and QRATOR passed as usual, and a fresh session
-after a captcha instead of solving it. A fresh session that is refused on its
-very first request means the whole IP is blocked; the client then waits.
+requests, PoW (HTTP 439) and QRATOR passed as usual. A captcha is solved in
+place (GeeTest); only if that fails is the session replaced. A fresh session
+that is refused on its very first request means the whole IP is blocked; the
+client then waits.
 """
 
 from __future__ import annotations
@@ -15,21 +16,21 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlencode
 
-from curl_cffi.requests.exceptions import (
-    ConnectionError as CurlConnectionError,
-    IncompleteRead,
-    Timeout as CurlTimeout,
-)
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
 import main
 
 DEFAULT_DELAY_SECONDS = 30.0
 IP_BLOCK_WAIT_SECONDS = 600
 MAX_POW_IN_A_ROW = 3
+MAX_CAPTCHA_SOLVES_IN_A_ROW = 2
 MAX_SESSION_RESETS_PER_PAGE = 3
+NETWORK_WAIT_SECONDS = 60
 FULL_PAGE_SIZE = 50
 
-TRANSPORT_ERRORS = (IncompleteRead, CurlConnectionError, CurlTimeout)
+# The base class: in stream mode curl_cffi raises a plain RequestException
+# (DNS timeout, dropped network) rather than Timeout/ConnectionError.
+TRANSPORT_ERRORS = (CurlRequestException,)
 
 
 @dataclass(frozen=True)
@@ -114,10 +115,26 @@ class CalmClient:
         if wait > 0:
             time.sleep(wait)
 
+    def _solve_captcha(self, response: Any) -> bool:
+        """Solve the captcha in the current session; False if it did not pass."""
+        referer = self.referer or main.REFERER
+        self.log("CAPTCHA")
+        try:
+            if main.is_firewall_captcha_dispatcher_response(response):
+                main.run_firewall_captcha_dispatcher(self.session, referer=referer)
+            else:
+                main.run_geetest_verification(self.session, response.text, referer=referer)
+        except Exception as exc:  # any solver failure falls back to a new session
+            self.log("CAPTCHA-FAILED", error=f"{type(exc).__name__}: {exc}"[:200])
+            return False
+        self.log("CAPTCHA-SOLVED")
+        return True
+
     def _get(self, url: str, *, document: bool) -> tuple[str, Any]:
         page_headers = {**main.REQUEST_HEADERS, "Referer": self.referer or main.REFERER}
         headers = main.DOCUMENT_REQUEST_HEADERS if document else page_headers
-        for _ in range(MAX_POW_IN_A_ROW + 1):
+        captchas = 0
+        for _ in range(MAX_POW_IN_A_ROW + MAX_CAPTCHA_SOLVES_IN_A_ROW + 1):
             self._pause()
             response = main.get_with_qrator_recovery(
                 self.session,
@@ -130,6 +147,11 @@ class CalmClient:
             )
             self.last_request = time.monotonic()
             kind = response_kind(response)
+            if kind == "captcha":
+                captchas += 1
+                if captchas > MAX_CAPTCHA_SOLVES_IN_A_ROW or not self._solve_captcha(response):
+                    return kind, response
+                continue
             if kind != "pow":
                 return kind, response
             main.run_pow_verification(self.session, pow_source(response, self.session))
@@ -144,7 +166,14 @@ class CalmClient:
             )
             main.set_session_headers(self.session, {**main.REQUEST_HEADERS, "Referer": catalog_url})
             self.referer = catalog_url
-            kind, _ = self._get(catalog_url, document=True)
+            try:
+                kind, _ = self._get(catalog_url, document=True)
+            except TRANSPORT_ERRORS as exc:
+                # No network (sleep, Wi-Fi drop): wait for it instead of failing.
+                self.session = None
+                self.log("NETWORK-WAIT", error=type(exc).__name__, wait_s=NETWORK_WAIT_SECONDS)
+                time.sleep(NETWORK_WAIT_SECONDS)
+                continue
             if kind == "ok":
                 self.sessions_opened += 1
                 return

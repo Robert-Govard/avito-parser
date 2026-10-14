@@ -9,8 +9,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only the old main.py flow solves GeeTest; avito.py never does, so a
-# normal install needs no git and no image/ML libraries.
+# GeeTest solver: avito.py solves captchas with it (`uv sync --extra captcha`);
+# without it a captcha only replaces the session, which rarely helps.
 captcha = [
     "ddddocr @ git+https://github.com/sml2h3/ddddocr.git@main",
     "numpy>=2.2.1",
