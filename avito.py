@@ -9,6 +9,7 @@
     uv run python avito.py table <поиск>                   # таблица Excel
     uv run python avito.py telegram setup                  # подключить свой бот
     uv run python avito.py telegram test
+    uv run python avito.py bot                             # команды из Telegram: ссылка → таблица
 
 A search is one JSON file in ``searches/`` (its name is the file name). Every
 search keeps its data in ``data/searches/<name>/`` and writes tables to
@@ -29,7 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import apartments
@@ -105,12 +106,14 @@ HUMAN = {
     "CAPTCHA": lambda f: "  · Авито показал капчу, решаю",
     "CAPTCHA-SOLVED": lambda f: "  ✓ капча решена, продолжаю",
     "CAPTCHA-FAILED": lambda f: f"  ✗ капча не решилась: {f['error']}",
-    "SESSION-RESET": lambda f: f"  · Авито не пускает ({f['reason']}), открываю новую сессию",
+    "SESSION-RESET": lambda f: ("  · Авито показал капчу" if f.get("reason") == "captcha"
+                                else f"  · Авито не пускает ({f.get('reason')})") + ", открываю новую сессию",
     "IP-BLOCK": lambda f: f"  ⏸ Авито ограничил доступ с этого IP, жду {f['wait_min']} мин и пробую снова",
     "TRANSPORT": lambda f: "  · обрыв связи, повторяю",
     "NETWORK-WAIT": lambda f: f"  ⏸ нет связи с Авито ({f['error']}), жду {f['wait_s']} с и пробую снова",
     "HEARTBEAT": lambda f: f"  · работаю: цикл {f['cycle']}, сессий открыто {f['sessions']}",
     "TELEGRAM-ERROR": lambda f: f"  ✗ Telegram: {f['error']}",
+    "BOT": lambda f: f"🤖 {f['text']}",
     "ERROR": lambda f: f"✗ Ошибка ({f.get('search', '')}): {f['error']}",
 }
 
@@ -198,14 +201,22 @@ def load_search(name: str) -> Search:
     )
 
 
-def write_table(search: Search, seen_before: dict[str, str]) -> Path | None:
+class SearchError(Exception):
+    """A search that cannot be added: bad name, bad link, Avito not answering."""
+
+
+class ScanStopped(Exception):
+    """Raised from a ``log`` callback to stop a scan between requests."""
+
+
+def write_table(search: Search, seen_before: dict[str, str], *, log: Any = None) -> Path | None:
     base = search.load("listings.json")
     if not base:
         return None
     profile = profiles.PROFILES[search.profile](base, search.home_city)
     path = OUTPUT_DIR / f"{search.name}-{datetime.now():%Y-%m-%d_%H-%M}.xlsx"
-    counts = profile.write_table(path, seen_before)
-    say("TABLE", search=search.name, path=str(path), **counts)
+    counts = profile.write_table(path, seen_before, title=search.title, link=search.catalog_url)
+    (log or say)("TABLE", search=search.name, path=str(path), **counts)
     return path
 
 
@@ -255,35 +266,56 @@ def suggested_name(url: str) -> str:
     return candidate
 
 
+def add_search(
+    url: str,
+    *,
+    name: str | None = None,
+    profile: str | None = None,
+    city: str | None = None,
+    watch_pages: int = DEFAULT_WATCH_PAGES,
+    replace: bool = False,
+    dry_run: bool = False,
+    delay: float = 5.0,
+    log: Any = None,
+) -> tuple[str, link_resolver.ResolvedSearch]:
+    """Check an Avito search link on Avito and save it; SearchError if that fails."""
+    name = name or suggested_name(url)
+    if not re.fullmatch(r"[a-z0-9_-]+", name):
+        raise SearchError("имя поиска: только латиница, цифры, «-» и «_»")
+    if (SEARCHES_DIR / f"{name}.json").exists() and not replace:
+        raise SearchError(f"поиск «{name}» уже есть; другое имя: --name, перезаписать: --replace")
+    cache = load_json(LOCATIONS_CACHE)
+    client = avito_client.CalmClient(delay=delay, log=log or say)
+    try:
+        resolved = link_resolver.resolve(client, url, locations_cache=cache, city=city, profile=profile)
+    except link_resolver.LinkError as exc:
+        raise SearchError(str(exc)) from None
+    except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
+        raise SearchError(f"Авито не ответил: {exc}") from None
+    save_json(LOCATIONS_CACHE, cache)
+    if not dry_run:
+        SEARCHES_DIR.mkdir(parents=True, exist_ok=True)
+        (SEARCHES_DIR / f"{name}.json").write_text(
+            json.dumps(resolved.config(watch_pages), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return name, resolved
+
+
 def cmd_add(args: argparse.Namespace) -> None:
     """Turn an Avito search link into a saved search after checking it on Avito."""
-    name = args.name or suggested_name(args.url)
-    if not re.fullmatch(r"[a-z0-9_-]+", name):
-        fail("имя поиска: только латиница, цифры, «-» и «_»")
-    if (SEARCHES_DIR / f"{name}.json").exists() and not args.replace:
-        fail(f"поиск «{name}» уже есть; другое имя: --name, перезаписать: --replace")
-    cache = load_json(LOCATIONS_CACHE)
-    client = avito_client.CalmClient(delay=args.delay, log=say)
     try:
-        resolved = link_resolver.resolve(
-            client, args.url, locations_cache=cache, city=args.city, profile=args.profile
+        name, resolved = add_search(
+            args.url, name=args.name, profile=args.profile, city=args.city, watch_pages=args.watch_pages,
+            replace=args.replace, dry_run=args.dry_run, delay=args.delay,
         )
-    except link_resolver.LinkError as exc:
+    except SearchError as exc:
         fail(str(exc))
-    except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
-        fail(f"Авито не ответил: {exc}")
-    save_json(LOCATIONS_CACHE, cache)
     summary = {
         "name": name, "title": resolved.title, "profile": resolved.profile, "city": resolved.city,
         "total": resolved.total, "filters": resolved.filters, "samples": resolved.samples,
         "warnings": resolved.warnings, "saved": not args.dry_run,
     }
-    if not args.dry_run:
-        SEARCHES_DIR.mkdir(parents=True, exist_ok=True)
-        (SEARCHES_DIR / f"{name}.json").write_text(
-            json.dumps(resolved.config(args.watch_pages), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
     if JSON_OUTPUT:
         print(json.dumps({"event": "ADDED", **summary}, ensure_ascii=False), flush=True)
         return
@@ -325,15 +357,31 @@ def cmd_list(_: argparse.Namespace) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> None:
     """Walk the search from the saved page to the last one, saving every page."""
-    search = load_search(args.name)
+    scan_search(load_search(args.name), full=args.full, max_pages=args.max_pages, delay=args.delay)
+
+
+def scan_search(
+    search: Search,
+    *,
+    full: bool = False,
+    max_pages: int = MAX_PAGES,
+    delay: float = avito_client.DEFAULT_DELAY_SECONDS,
+    log: Any = None,
+) -> Path | None:
+    """Collect the search page by page, then write its table (None if nothing is stored).
+
+    A stopped or failed scan keeps what it has collected, writes the table
+    anyway, and the next scan continues from the page it stopped at.
+    """
+    say_ = log or say
     state = search.load("state.json")
-    start = 1 if args.full or state.get("complete") else int(state.get("next_page", 1))
+    start = 1 if full or state.get("complete") else int(state.get("next_page", 1))
     seen = search.load("seen.json")
     seen_before = dict(seen)
     base = search.load("listings.json")
-    client = avito_client.CalmClient(delay=args.delay, log=say)
-    say("SCAN", search=search.name, start_page=start)
-    last_page = min(start + args.max_pages - 1, MAX_PAGES)
+    client = avito_client.CalmClient(delay=delay, log=say_)
+    say_("SCAN", search=search.name, start_page=start)
+    last_page = min(start + max_pages - 1, MAX_PAGES)
     number = start
     try:
         while number <= last_page:
@@ -350,15 +398,84 @@ def cmd_scan(args: argparse.Namespace) -> None:
             search.save("seen.json", seen)
             complete = page.is_last or number >= MAX_PAGES
             search.save("state.json", {"complete": complete, "next_page": 1 if complete else number + 1})
-            say("PAGE", search=search.name, page=number, items=len(page.items), new=new, total=page.total_count)
+            say_("PAGE", search=search.name, page=number, items=len(page.items), new=new, total=page.total_count)
             if complete:
                 break
             number += 1
     except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
-        say("ERROR", search=search.name, page=number, error=f"{type(exc).__name__}: {exc}"[:300])
-    except KeyboardInterrupt:
-        say("ERROR", search=search.name, page=number, error="остановлено; следующий scan продолжит с этой страницы")
-    write_table(search, seen_before)
+        say_("ERROR", search=search.name, page=number, error=f"{type(exc).__name__}: {exc}"[:300])
+    except (KeyboardInterrupt, ScanStopped):
+        say_("ERROR", search=search.name, page=number, error="остановлено; следующий scan продолжит с этой страницы")
+    return write_table(search, seen_before, log=say_)
+
+
+class Watch:
+    """One watched search: the listings it has seen and how it judges new ones."""
+
+    def __init__(self, search: Search) -> None:
+        self.search = search
+        self.primed = False
+        self.reload()
+
+    def reload(self) -> None:
+        """Re-read the stored listings, e.g. after a scan has added to them."""
+        search = self.search
+        self.base = search.load("listings.json")
+        self.seen = search.load("seen.json")
+        self.profile = profiles.PROFILES[search.profile](self.base, search.home_city, search.alert_sellers)
+        search.dir.mkdir(parents=True, exist_ok=True)
+
+    def check(
+        self,
+        client: avito_client.CalmClient,
+        *,
+        on_alert: Callable[[dict[str, Any]], None] = lambda fields: None,
+        log: Any = None,
+    ) -> None:
+        """Read the first pages once and alert on listings not seen before.
+
+        The first check only remembers what is already listed: alerts are for
+        listings that appear after watching starts.
+        """
+        say_ = log or say
+        search, base, seen = self.search, self.base, self.seen
+        changed = False
+        first_pass = not self.primed
+        remembered = 0
+        for number in range(1, search.watch_pages + 1):
+            page = client.page(catalog_url=search.catalog_url, params=search.request_params, number=number)
+            stamp = datetime.now().isoformat(timespec="seconds")
+            for item in page.items:
+                key = str(item["id"])
+                if key in seen:
+                    continue
+                seen[key] = stamp
+                base[key] = item
+                changed = True
+                if first_pass:
+                    remembered += 1
+                    continue
+                listed_at = listed_since(item)
+                if not is_fresh(listed_at, search.fresh_hours):
+                    continue
+                fields = self.profile.alert(item)
+                if fields is None:
+                    continue
+                fields = {"search": search.name, **fields}
+                if search.new_only and not check_newly_created(client, search, fields):
+                    continue
+                if listed_at is not None:
+                    fields["listed_at"] = listed_at.strftime("%d.%m %H:%M")
+                with search.path("alerts.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"found": stamp, **fields}, ensure_ascii=False) + "\n")
+                say_("ALERT", **fields)
+                on_alert(fields)
+        if changed:
+            search.save("listings.json", base)
+            search.save("seen.json", seen)
+        if first_pass:
+            self.primed = True
+            say_("PRIMED", search=search.name, remembered=remembered)
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
@@ -370,68 +487,29 @@ def cmd_watch(args: argparse.Namespace) -> None:
             notifier = telegram_notify.Notifier.from_settings()
         except telegram_notify.TelegramError as exc:
             say("TELEGRAM-ERROR", error=str(exc))
+
+    def send(search: Search, fields: dict[str, Any]) -> None:
+        if notifier is None:
+            return
+        try:
+            notifier.send(telegram_notify.message_for(search.profile, search.name, fields))
+        except telegram_notify.TelegramError as exc:
+            say("TELEGRAM-ERROR", error=str(exc))
+
     client = avito_client.CalmClient(delay=args.delay, log=say)
-    watched = []
-    primed: set[str] = set()
-    for search in searches:
-        base = search.load("listings.json")
-        watched.append((search, base, search.load("seen.json"),
-                        profiles.PROFILES[search.profile](base, search.home_city, search.alert_sellers)))
-        search.dir.mkdir(parents=True, exist_ok=True)
+    watches = [Watch(search) for search in searches]
     say("WATCH", searches=[s.name for s in searches], interval_s=args.interval, telegram=notifier is not None)
     cycle = 0
     try:
         while True:
             cycle += 1
-            for search, base, seen, profile in watched:
+            for watch in watches:
                 try:
-                    changed = False
-                    # The first pass only remembers what is already listed:
-                    # alerts are for listings that appear after watch starts.
-                    first_pass = search.name not in primed
-                    remembered = 0
-                    for number in range(1, search.watch_pages + 1):
-                        page = client.page(catalog_url=search.catalog_url, params=search.request_params, number=number)
-                        stamp = datetime.now().isoformat(timespec="seconds")
-                        for item in page.items:
-                            key = str(item["id"])
-                            if key in seen:
-                                continue
-                            seen[key] = stamp
-                            base[key] = item
-                            changed = True
-                            if first_pass:
-                                remembered += 1
-                                continue
-                            listed_at = listed_since(item)
-                            if not is_fresh(listed_at, search.fresh_hours):
-                                continue
-                            fields = profile.alert(item)
-                            if fields is None:
-                                continue
-                            fields = {"search": search.name, **fields}
-                            if search.new_only and not check_newly_created(client, search, fields):
-                                continue
-                            if listed_at is not None:
-                                fields["listed_at"] = listed_at.strftime("%d.%m %H:%M")
-                            with search.path("alerts.jsonl").open("a", encoding="utf-8") as handle:
-                                handle.write(json.dumps({"found": stamp, **fields}, ensure_ascii=False) + "\n")
-                            say("ALERT", **fields)
-                            if notifier is not None:
-                                try:
-                                    notifier.send(telegram_notify.message_for(search.profile, search.name, fields))
-                                except telegram_notify.TelegramError as exc:
-                                    say("TELEGRAM-ERROR", error=str(exc))
-                    if changed:
-                        search.save("listings.json", base)
-                        search.save("seen.json", seen)
-                    if first_pass:
-                        primed.add(search.name)
-                        say("PRIMED", search=search.name, remembered=remembered)
+                    watch.check(client, on_alert=lambda fields, search=watch.search: send(search, fields))
                 except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
-                    say("ERROR", search=search.name, error=f"{type(exc).__name__}: {exc}"[:300])
-                if cycle % MARKET_REFRESH_EVERY_CYCLES == 0 and hasattr(profile, "refresh_market"):
-                    profile.refresh_market()
+                    say("ERROR", search=watch.search.name, error=f"{type(exc).__name__}: {exc}"[:300])
+                if cycle % MARKET_REFRESH_EVERY_CYCLES == 0 and hasattr(watch.profile, "refresh_market"):
+                    watch.profile.refresh_market()
             if cycle % HEARTBEAT_EVERY_CYCLES == 0:
                 say("HEARTBEAT", cycle=cycle, sessions=client.sessions_opened)
             time.sleep(args.interval * random.uniform(0.8, 1.2))
@@ -471,6 +549,19 @@ def cmd_telegram(args: argparse.Namespace) -> None:
         print("✓ Тестовое сообщение отправлено")
     except telegram_notify.TelegramError as exc:
         fail(str(exc))
+
+
+def cmd_bot(args: argparse.Namespace) -> None:
+    """Take commands from the Telegram chat: a link or /scan → collect → Excel table."""
+    import telegram_bot
+
+    try:
+        telegram_bot.run(delay=args.delay, watch_interval=args.watch_interval)
+    except telegram_notify.TelegramError as exc:
+        fail(str(exc))
+    except KeyboardInterrupt:
+        if not JSON_OUTPUT:
+            print("\nБот остановлен.")
 
 
 def use_utf8_output() -> None:
@@ -539,6 +630,11 @@ def main_cli(argv: list[str] | None = None) -> None:
     telegram.add_argument("action", choices=("setup", "test"))
     telegram.add_argument("--new-token", action="store_true", help="ввести токен заново")
     telegram.set_defaults(func=cmd_telegram)
+
+    bot = sub.add_parser("bot", help="принимать команды из Telegram: ссылка → сбор → таблица Excel в чат")
+    bot.add_argument("--delay", type=float, default=avito_client.DEFAULT_DELAY_SECONDS)
+    bot.add_argument("--watch-interval", type=float, default=60, help="секунд между проверками новых объявлений")
+    bot.set_defaults(func=cmd_bot)
 
     args = parser.parse_args(argv)
     JSON_OUTPUT = args.json

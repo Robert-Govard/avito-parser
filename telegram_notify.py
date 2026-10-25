@@ -16,6 +16,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -50,11 +51,21 @@ def save_settings(settings: dict[str, Any], path: Path = SETTINGS_PATH) -> None:
         pass
 
 
-def call(token: str, method: str, payload: dict[str, Any] | None = None) -> Any:
-    """One Bot API call; a network hiccup is retried before giving up."""
+def call(
+    token: str,
+    method: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    file: tuple[str, Path] | None = None,
+    timeout: float = TIMEOUT_SECONDS,
+) -> Any:
+    """One Bot API call; a network hiccup is retried before giving up.
+
+    ``file`` is (field, path) for uploads such as sendDocument.
+    """
     for attempt in range(NETWORK_ATTEMPTS):
         try:
-            return _call_once(token, method, payload)
+            return _call_once(token, method, payload, file=file, timeout=timeout)
         except TelegramNetworkError:
             if attempt == NETWORK_ATTEMPTS - 1:
                 raise
@@ -66,14 +77,39 @@ class TelegramNetworkError(TelegramError):
     pass
 
 
-def _call_once(token: str, method: str, payload: dict[str, Any] | None) -> Any:
+def _multipart(fields: dict[str, Any], field: str, path: Path) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{text}\r\n'.encode())
+    filename = path.name.replace('"', "")
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n".encode()
+    )
+    parts.append(path.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _call_once(
+    token: str,
+    method: str,
+    payload: dict[str, Any] | None,
+    *,
+    file: tuple[str, Path] | None = None,
+    timeout: float = TIMEOUT_SECONDS,
+) -> Any:
+    if file is None:
+        data, content_type = json.dumps(payload or {}).encode("utf-8"), "application/json"
+    else:
+        data, content_type = _multipart(payload or {}, *file)
     request = urllib.request.Request(
-        API.format(token=token, method=method),
-        data=json.dumps(payload or {}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        API.format(token=token, method=method), data=data, headers={"Content-Type": content_type}
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             answer = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -112,13 +148,30 @@ class Notifier:
             return cls(settings["token"], int(settings["chat_id"]))
         return None
 
-    def send(self, text: str) -> None:
-        call(self.token, "sendMessage", {
+    def send(self, text: str, *, preview: bool = True, **extra: Any) -> int:
+        """Send a message; returns its id (to edit it later)."""
+        message = call(self.token, "sendMessage", {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": not preview,
+            **extra,
         })
+        return int(message["message_id"])
+
+    def edit(self, message_id: int, text: str, **extra: Any) -> None:
+        try:
+            call(self.token, "editMessageText", {
+                "chat_id": self.chat_id, "message_id": message_id, "text": text,
+                "parse_mode": "HTML", "disable_web_page_preview": True, **extra,
+            })
+        except TelegramError as exc:
+            if "message is not modified" not in str(exc):
+                raise
+
+    def send_document(self, path: Path, caption: str = "") -> None:
+        call(self.token, "sendDocument", {"chat_id": str(self.chat_id), "caption": caption, "parse_mode": "HTML"},
+             file=("document", path), timeout=120)
 
 
 def esc(value: Any) -> str:

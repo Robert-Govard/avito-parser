@@ -256,6 +256,35 @@ def filters_of(payload: dict[str, Any]) -> dict[str, Filter]:
     return found
 
 
+def rubric_params(payload: dict[str, Any], blob: str) -> dict[str, str]:
+    """Category parameters of the rubricator node whose link carries ``blob``.
+
+    The category part of a link can encode a value id the API does not use
+    ("Комплектующие" is 483=6589 in a link and 483=6581 in the API, and the
+    search then finds nothing); the category tree spells the right ones.
+    """
+    found: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if found:
+            return
+        if isinstance(node, dict):
+            url, params = node.get("url"), node.get("params")
+            if isinstance(url, str) and isinstance(params, dict) and params:
+                parts = urlsplit(url)
+                if parts.path.endswith(f"-{blob}") or dict(parse_qsl(parts.query)).get("f") == blob:
+                    found.update({f"params[{key}]": str(value) for key, value in params.items()})
+                    return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload.get("rubricators"))
+    return found
+
+
 def value_by_slug(f: Filter, slugs: tuple[str, ...]) -> str | None:
     """The filter value whose name is spelled in the link path, e.g. "512 ГБ" ~ 512_gb."""
     for value, name in f.values.items():
@@ -403,7 +432,10 @@ def resolve(
         extra: dict[str, str] = {}
         for _ in range(MAX_FILTER_ROUNDS):
             check = client.page_payload(catalog_url=referer, params={**params, **extra}, number=1)
-            mapped, warnings = filter_params(pairs, filters_of(check), link.path_slugs)
+            rubric = rubric_params(check, link.blob)
+            rest = [(attribute, value) for attribute, value in pairs if f"params[{attribute}]" not in rubric]
+            mapped, warnings = filter_params(rest, filters_of(check), link.path_slugs)
+            mapped = {**rubric, **mapped}
             if mapped == extra:
                 break
             extra = mapped

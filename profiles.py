@@ -93,7 +93,7 @@ class RealtyOwnerProfile:
             return None
         return alert_fields(listing)
 
-    def write_table(self, path: Path, seen_before: dict[str, str]) -> dict[str, int]:
+    def write_table(self, path: Path, seen_before: dict[str, str], **_: Any) -> dict[str, int]:
         listings = [
             apartments.classify(apartments.listing_from_item(item))
             for item in self.base.values()
@@ -137,13 +137,15 @@ class GoodsProfile:
         goods.annotate([offer], self.stats, self.home_city)
         return goods.alert_fields(offer)
 
-    def write_table(self, path: Path, seen_before: dict[str, str]) -> dict[str, int]:
+    def write_table(
+        self, path: Path, seen_before: dict[str, str], *, title: str = "", link: str = ""
+    ) -> dict[str, int]:
         offers = [goods.offer_from_item(item) for item in self.base.values()]
         stats = goods.market_stats(offers)
         goods.annotate(offers, stats, self.home_city)
         for offer in offers:
             offer.listing.is_new = str(offer.listing.id) not in seen_before
-        goods.write_workbook(path, offers, stats)
+        goods.write_workbook(path, offers, stats, title=title, link=link, home_city=self.home_city)
         return {"объявлений": len(offers), "групп с рыночной ценой": len(stats)}
 
 

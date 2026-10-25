@@ -65,6 +65,8 @@ def test_annotations_mark_cheap_defect_shop_and_other_city():
 
 def test_not_broken_is_not_a_defect():
     assert not goods.offer_from_item(phone(1, 35_000, description="Не битый, не вскрывался")).defect
+    assert goods.offer_from_item(phone(2, 500, title="Неисправный жесткий диск")).defect
+    assert goods.offer_from_item(phone(3, 400, title="Коробка списанных нерабочих дисков")).defect
 
 
 def test_goods_profile_alerts_only_for_home_city(tmp_path):
@@ -78,7 +80,7 @@ def test_goods_profile_alerts_only_for_home_city(tmp_path):
 
     path = tmp_path / "phones.xlsx"
     profile.write_table(path, seen_before={})
-    assert load_workbook(path).sheetnames == ["Рынок", "Объявления"]
+    assert load_workbook(path).sheetnames == ["Сводка", "Объявления", "Рыночные цены"]
 
 
 def test_short_page_is_last():
@@ -123,3 +125,29 @@ def test_pow_challenge_comes_from_cookie_for_html_pages():
 
     source = avito_client.pow_source(Html439(), Session())
     assert source.json() == {"pow_challenge": "abc"}
+
+
+def test_table_is_sorted_by_price_with_readable_columns(tmp_path):
+    base = {str(i): phone(i, price) for i, price in enumerate((36_000, 35_000, 37_000, 36_500))}
+    base["9"] = phone(9, 9_000, description="Заблокирован, на запчасти")
+    base["8"] = phone(8, 20_000, closed="300 завершённых объявлений")
+    path = tmp_path / "phones.xlsx"
+    profiles.GoodsProfile(base, "sankt-peterburg").write_table(path, seen_before={}, title="iPhone 15", link="https://www.avito.ru/x")
+    book = load_workbook(path)
+
+    sheet = book["Объявления"]
+    header = [cell.value for cell in sheet[1]]
+    assert "Новое" not in header and "Оценка Авито" not in header  # all new / all empty
+    rows = [dict(zip(header, (cell.value for cell in row))) for row in sheet.iter_rows(min_row=2)]
+    assert [row["Цена"] for row in rows] == sorted(row["Цена"] for row in rows)
+    assert rows[0]["Название"].startswith("iPhone 15") and sheet["A2"].hyperlink.target.startswith("https://www.avito.ru/")
+    assert isinstance(rows[-1]["К рынку"], float) and sheet.cell(row=2, column=header.index("Цена") + 1).number_format == goods.PRICE_FORMAT
+    assert rows[0]["Продавец"] == "частное лицо" and rows[1]["Продавец"] == goods.RESELLER
+    assert sheet["A2"].fill.fgColor.rgb.endswith(goods.DEFECT_FILL)  # the locked one is cheapest
+
+    summary = [[cell.value for cell in row] for row in book["Сводка"].iter_rows()]
+    assert summary[0][0] == "iPhone 15"
+    assert ["Всего объявлений", 6] == summary[next(i for i, r in enumerate(summary) if r[0] == "Всего объявлений")][:2]
+    cheapest = next(i for i, r in enumerate(summary) if r[0] and str(r[0]).startswith("Самые дешёвые"))
+    first = next(r for r in summary[cheapest + 1:] if isinstance(r[0], int))
+    assert first[0] == 35_000  # private, not broken, not the reseller

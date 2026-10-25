@@ -121,3 +121,13 @@ def test_unrecognised_value_of_a_known_filter_is_left_out_not_sent_blindly():
 def test_memory_names_transliterate_like_link_slugs():
     assert lr.transliterate("512 ГБ") == "512_gb"
     assert lr.transliterate("1 ТБ") == "1_tb"
+
+
+def test_category_values_come_from_the_rubricator_node_of_the_link():
+    blob = "ASgBAgICAkTGB~pm7gmwZw"
+    payload = {"rubricators": {"side": {"nodes": [{"children": [
+        {"url": "/moskva/tovary_dlya_kompyutera/komplektuyuschie-ASgBAgICAUTGB~pm?cd=1", "params": {"483": 6581}},
+        {"url": f"/moskva/tovary_dlya_kompyutera/komplektuyuschie/zhestkie_diski-{blob}?cd=1&q=hdd", "params": {"483": 6581, "631": 6616}},
+    ]}]}}}
+    assert lr.rubric_params(payload, blob) == {"params[483]": "6581", "params[631]": "6616"}
+    assert lr.rubric_params(payload, "other") == {}

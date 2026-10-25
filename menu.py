@@ -216,12 +216,16 @@ def telegram_menu() -> None:
     connected = telegram_notify.Notifier.from_settings() is not None
     action = choose(
         f"Telegram: {'подключён ✓' if connected else 'не подключён'}",
-        ["Подключить своего бота" if not connected else "Подключить заново", "Отправить тестовое сообщение"],
+        ["Подключить своего бота" if not connected else "Подключить заново", "Отправить тестовое сообщение",
+         "Запустить бота: ссылка в Telegram → таблица Excel"],
     )
     if action == 0:
         run(avito.cmd_telegram, action="setup", new_token=connected)
     elif action == 1:
         run(avito.cmd_telegram, action="test", new_token=False)
+    elif action == 2:
+        print("Бот принимает команды в Telegram. Вернуться в меню: Ctrl+C")
+        run(avito.cmd_bot, delay=avito_client.DEFAULT_DELAY_SECONDS, watch_interval=60)
 
 
 def main() -> None:
