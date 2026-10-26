@@ -225,7 +225,7 @@ def telegram_menu() -> None:
         run(avito.cmd_telegram, action="test", new_token=False)
     elif action == 2:
         print("Бот принимает команды в Telegram. Вернуться в меню: Ctrl+C")
-        run(avito.cmd_bot, delay=avito_client.DEFAULT_DELAY_SECONDS, watch_interval=60)
+        run(avito.cmd_bot, delay=avito_client.DEFAULT_DELAY_SECONDS, watch_interval=60, scan_proxy=None)
 
 
 def main() -> None:

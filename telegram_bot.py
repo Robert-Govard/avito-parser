@@ -8,9 +8,16 @@ in a background thread, so the bot keeps answering /status and /stop while a
 scan walks Avito at its calm pace. One status message is edited as pages come
 in; the finished table arrives as an .xlsx document.
 
-Watched searches ("👀 Следить") are checked between jobs, about once a minute:
-the first page of each, new listings sent to the chat like ``avito.py watch``
-does. Jobs come first; the watch list survives restarts.
+Watched searches ("👀 Следить") are checked about once a minute in a thread
+of their own: the first page of each, new listings sent to the chat like
+``avito.py watch`` does. The watch list survives restarts.
+
+Avito limits requests per IP address. Watch checks leave from this server;
+jobs (scans, adding a link) leave through ``--scan-proxy`` (an SSH tunnel to
+another server), so both run at full pace without waiting for each other.
+If the proxy is down or blocked, jobs fall back to this server's address
+and share its pace with the checks (avito_client.Pacer) until it is retried.
+Both threads add to a search's stored listings (Search.save_collected).
 """
 
 from __future__ import annotations
@@ -20,12 +27,14 @@ import math
 import queue
 import random
 import re
+import socket
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import avito
 import avito_client
@@ -37,7 +46,7 @@ NETWORK_PAUSE_SECONDS = 10
 CONFLICT_PAUSE_SECONDS = 30
 WATCH_INTERVAL_SECONDS = 60
 WATCH_FAILURES_TO_REPORT = 3
-WATCH_JOB = "проверка новых объявлений"
+PROXY_RETRY_SECONDS = 30 * 60
 AVITO_LINK = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+")
 # Client events worth showing under the progress line.
 NOTEWORTHY = {"CAPTCHA", "CAPTCHA-SOLVED", "CAPTCHA-FAILED", "SESSION-RESET", "IP-BLOCK", "NETWORK-WAIT", "ERROR"}
@@ -137,12 +146,27 @@ def title_of(name: str) -> str:
         return name
 
 
+class ProxyFailed(avito.ScanStopped):
+    """The job's proxy went down or got blocked: stop, then go on without it."""
+
+
+def proxy_reachable(proxy: str) -> bool:
+    parts = urlsplit(proxy)
+    try:
+        socket.create_connection((parts.hostname or "127.0.0.1", parts.port or 1080), timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
 class Progress:
     """The status message of one job and the ``log`` callback that edits it."""
 
     def __init__(self, bot: "Bot", head: str) -> None:
         self.bot = bot
         self.head = head
+        self.via_proxy = False  # set by Bot.with_job_client
+        self.proxy_failed = False
         self.line = ""
         self.event = ""
         self.collected = 0
@@ -168,6 +192,11 @@ class Progress:
         if self.bot.stop.is_set():
             self.bot.stop.clear()
             raise avito.ScanStopped
+        if self.via_proxy and kind in ("IP-BLOCK", "NETWORK-WAIT") and not self.proxy_failed:
+            # Not worth waiting out: the job goes on from this server instead.
+            self.proxy_failed = True
+            self.bot.proxy_down("Авито не пускает через него" if kind == "IP-BLOCK" else "нет связи через туннель")
+            raise ProxyFailed
         if kind == "PAGE":
             self.collected += int(fields.get("items") or 0)
             pages = min(max(1, math.ceil(int(fields.get("total") or 0) / avito_client.FULL_PAGE_SIZE)), avito.MAX_PAGES)
@@ -189,7 +218,12 @@ class Progress:
 
 class Bot:
     def __init__(
-        self, notifier: telegram_notify.Notifier, *, delay: float, watch_interval: float = WATCH_INTERVAL_SECONDS
+        self,
+        notifier: telegram_notify.Notifier,
+        *,
+        delay: float,
+        watch_interval: float = WATCH_INTERVAL_SECONDS,
+        scan_proxy: str | None = None,
     ) -> None:
         self.notifier = notifier
         self.delay = delay
@@ -197,11 +231,18 @@ class Bot:
         self.current: Job | None = None
         self.stop = threading.Event()
         self.watch_interval = watch_interval
-        self.watching = load_watching()  # names; changed by the Telegram side, read by the worker
+        self.watching = load_watching()  # names; changed by the Telegram side, read by the watch thread
         self.watch_lock = threading.Lock()
         self.watch_due = 0.0  # time.monotonic() of the next watch cycle
         self.announce: set[str] = set()  # newly watched: tell when the current listings are remembered
-        # Worker side only:
+        self.reload_watches = threading.Event()  # a job stored listings the watches have not seen
+        # This server's address: watch checks always, jobs only when the proxy is out.
+        self.pacer = avito_client.Pacer(delay)
+        self.scan_proxy = scan_proxy
+        self.proxy_off_until = 0.0
+        # Job thread only:
+        self._job_clients: dict[bool, avito_client.CalmClient] = {}
+        # Watch thread only:
         self.watches: dict[str, avito.Watch] = {}
         self.failures: dict[str, int] = {}
         self.watch_client: avito_client.CalmClient | None = None
@@ -229,6 +270,7 @@ class Bot:
         if backlog:
             offset = backlog[-1]["update_id"] + 1
         threading.Thread(target=self.work, daemon=True).start()
+        threading.Thread(target=self.watch_loop, daemon=True).start()
         watching = f"\n\n👀 Слежу за: {esc(', '.join(title_of(n) for n in sorted(self.watching)))}" if self.watching else ""
         self.say("🤖 Бот на связи.\n\n" + HELP + watching, reply_markup=KEYBOARD)
         avito.say("BOT", text="бот запущен, жду команд в Telegram. Остановить: Ctrl+C")
@@ -391,7 +433,6 @@ class Bot:
             with self.watch_lock:
                 self.watching.discard(name)
             self.announce.discard(name)
-            self.watches.pop(name, None)
             avito.delete_search(name)
         self.save_watching()
         self.say(f"🗑 Удалено: {what}." + ("" if search_names() else " Список поисков пуст — пришлите ссылку на новый."))
@@ -453,9 +494,12 @@ class Bot:
         if self.watching:
             wait = round(self.watch_due - time.monotonic())
             lines.append(f"👀 Слежу за: {esc(', '.join(title_of(n) for n in sorted(self.watching)))}"
-                         + (f"; следующая проверка через ~{wait} с" if wait > 0 else ""))
+                         + (f"; следующая проверка через ~{wait} с" if wait > 0 else "; проверяю сейчас"))
         elif self.current is None:
             lines.append("Пришлите ссылку или откройте «📋 Мои поиски».")
+        if self.scan_proxy:
+            lines.append("Сбор идёт через второй сервер, слежение ему не мешает." if self.proxy_usable()
+                         else "Второй сервер сейчас недоступен: сбор идёт отсюда, вперемешку со слежением.")
         self.say("\n".join(lines))
 
     def stop_jobs(self) -> None:
@@ -467,11 +511,8 @@ class Bot:
             except queue.Empty:
                 break
         if self.current is None:
-            self.say("Нечего останавливать." if not dropped else f"Очередь очищена ({dropped}).")
-            return
-        if self.current.title == WATCH_JOB:
-            self.say("Сейчас идёт проверка новых объявлений, она скоро закончится. "
-                     "Выключить слежение — кнопка «👀 Слежение»." + (f" Очередь очищена ({dropped})." if dropped else ""))
+            self.say(("Нечего останавливать." if not dropped else f"Очередь очищена ({dropped}).")
+                     + (" Слежение не останавливаю — его выключает кнопка «👀 Слежение»." if self.watching else ""))
             return
         self.stop.set()
         self.say("Останавливаю после текущего запроса к Авито…"
@@ -483,20 +524,11 @@ class Bot:
         if ahead:
             self.say(f"Поставил в очередь: {esc(job.title)} (перед ним {ahead}).")
 
-    # --- worker side ---------------------------------------------------
+    # --- job thread ----------------------------------------------------
 
     def work(self) -> None:
         while True:
-            try:
-                job = self.jobs.get(timeout=1)
-            except queue.Empty:
-                if self.watching and time.monotonic() >= self.watch_due:
-                    try:
-                        self.watch_cycle()
-                    except Exception:  # a bug in one cycle must not stop the worker
-                        traceback.print_exc()
-                        self.watch_due = time.monotonic() + self.watch_interval
-                continue
+            job = self.jobs.get()
             self.current = job
             self.stop.clear()
             try:
@@ -512,28 +544,80 @@ class Bot:
                 self.say(f"✗ Ошибка: {esc(type(exc).__name__)}: {esc(str(exc)[:300])}")
             finally:
                 self.current = None
-                # A scan may have stored listings a watch has not seen yet.
-                for watch in self.watches.values():
-                    watch.reload()
+                self.reload_watches.set()
+
+    def proxy_usable(self) -> bool:
+        return bool(self.scan_proxy) and time.monotonic() >= self.proxy_off_until
+
+    def proxy_down(self, reason: str) -> None:
+        self.proxy_off_until = time.monotonic() + PROXY_RETRY_SECONDS
+        self._job_clients.pop(True, None)  # a fresh session next time
+        self.say(f"⚠ Второй сервер для сбора недоступен ({esc(reason)}). Собираю отсюда, вперемешку со слежением; "
+                 f"попробую снова через {PROXY_RETRY_SECONDS // 60} мин.")
+
+    def job_client(self) -> tuple[avito_client.CalmClient, bool]:
+        """The client for a job and whether it goes through the proxy."""
+        via_proxy = self.proxy_usable()
+        if via_proxy and not proxy_reachable(self.scan_proxy):
+            self.proxy_down("туннель не отвечает")
+            via_proxy = False
+        if via_proxy not in self._job_clients:
+            self._job_clients[via_proxy] = (
+                avito_client.CalmClient(delay=self.delay, proxy=self.scan_proxy) if via_proxy
+                else avito_client.CalmClient(pacer=self.pacer)  # this server's address: share its pace
+            )
+        return self._job_clients[via_proxy], via_proxy
+
+    def with_job_client(self, progress: Progress, action: Callable[[avito_client.CalmClient], Any]) -> Any:
+        """Run ``action`` with the job's client; if the proxy fails midway, again without it."""
+        while True:
+            client, progress.via_proxy = self.job_client()
+            progress.proxy_failed = False
+            client.log = progress.log  # captchas and blocks show in the job's status
+            try:
+                result = action(client)
+            except ProxyFailed:
+                result = None
+            finally:
+                client.log = avito.say
+            if not progress.proxy_failed:
+                return result
+            progress.error = ""  # the scan stopped only to switch; it goes on below
+            progress.event = "↪ второй сервер недоступен, продолжаю отсюда"
+            progress.show()
+
+    # --- watch thread --------------------------------------------------
+
+    def watch_loop(self) -> None:
+        while True:
+            if self.watching and time.monotonic() >= self.watch_due:
+                try:
+                    self.watch_cycle()
+                except Exception:  # a bug in one cycle must not stop the thread
+                    traceback.print_exc()
+                    self.watch_due = time.monotonic() + self.watch_interval
+            else:
+                time.sleep(1)
 
     def watch_cycle(self) -> None:
-        """Check every watched search once; a job sent meanwhile goes first."""
-        self.current = Job(WATCH_JOB, lambda: None)
-        try:
-            if self.watch_client is None:
-                self.watch_client = avito_client.CalmClient(delay=self.delay, log=avito.say)
-            self.cycles += 1
-            with self.watch_lock:
-                names = sorted(self.watching)
-            for name in set(self.watches) - set(names):
-                del self.watches[name]
-            for name in names:
-                if not self.jobs.empty():
-                    return  # due stays in the past: the cycle starts over after the job
+        """Check every watched search once."""
+        if self.watch_client is None:
+            self.watch_client = avito_client.CalmClient(log=avito.say, pacer=self.pacer)
+        if self.reload_watches.is_set():
+            self.reload_watches.clear()
+            for watch in self.watches.values():
+                watch.reload()
+        started = time.monotonic()
+        self.cycles += 1
+        with self.watch_lock:
+            names = sorted(self.watching)
+        for name in set(self.watches) - set(names):
+            del self.watches[name]
+        for name in names:
+            if name in self.watching:  # not unwatched or deleted meanwhile
                 self.check_one(name)
-            self.watch_due = time.monotonic() + self.watch_interval * random.uniform(0.8, 1.2)
-        finally:
-            self.current = None
+        # Counted from the start: with many searches the checks simply run back to back.
+        self.watch_due = started + self.watch_interval * random.uniform(0.9, 1.1)
 
     def check_one(self, name: str) -> None:
         watch = self.watches.get(name)
@@ -574,7 +658,9 @@ class Bot:
             self.scan(existing)
             return
         progress = Progress(self, "🔎 Проверяю ссылку на Авито, около минуты…")
-        name, resolved = avito.add_search(url, delay=5.0, log=progress.log)
+        name, resolved = self.with_job_client(
+            progress, lambda client: avito.add_search(url, log=progress.log, client=client)
+        )
         lines = [f"✓ Поиск сохранён: <b>{esc(resolved.title)}</b> · {esc(resolved.city)}",
                  f"Объявлений сейчас: {resolved.total} · имя: <code>{esc(name)}</code>"]
         if resolved.filters:
@@ -589,7 +675,9 @@ class Bot:
     def scan(self, name: str) -> None:
         search = avito.load_search(name)
         progress = Progress(self, f"⏳ Собираю <b>{esc(search.title)}</b>…")
-        path = avito.scan_search(search, delay=self.delay, log=progress.log)
+        path = self.with_job_client(
+            progress, lambda client: avito.scan_search(search, delay=self.delay, log=progress.log, client=client)
+        )
         self.send_table(search, path, progress)
 
     def table(self, name: str) -> None:
@@ -610,8 +698,13 @@ class Bot:
         self.notifier.send_document(path, caption="\n".join(caption)[:1024])
 
 
-def run(*, delay: float = avito_client.DEFAULT_DELAY_SECONDS, watch_interval: float = WATCH_INTERVAL_SECONDS) -> None:
+def run(
+    *,
+    delay: float = avito_client.DEFAULT_DELAY_SECONDS,
+    watch_interval: float = WATCH_INTERVAL_SECONDS,
+    scan_proxy: str | None = None,
+) -> None:
     notifier = telegram_notify.Notifier.from_settings()
     if notifier is None:
         raise TelegramError("Telegram не подключён: uv run python avito.py telegram setup")
-    Bot(notifier, delay=delay, watch_interval=watch_interval).run()
+    Bot(notifier, delay=delay, watch_interval=watch_interval, scan_proxy=scan_proxy).run()

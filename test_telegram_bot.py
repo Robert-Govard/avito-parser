@@ -92,7 +92,7 @@ def test_scan_reports_pages_and_sends_the_table(bot, monkeypatch, tmp_path):
     table = tmp_path / "t.xlsx"
     table.write_bytes(b"xlsx")
 
-    def fake_scan(search, *, delay, log):
+    def fake_scan(search, *, delay, log, client=None):
         log("PAGE", search=search.name, page=1, items=50, new=50, total=120)
         log("TABLE", search=search.name, path=str(table), объявлений=50)
         return table
@@ -165,22 +165,12 @@ def test_watch_cycle_primes_then_alerts_and_waits_for_the_interval(bot, monkeypa
     assert 'href="https://www.avito.ru/x_1"' in bot.notifier.sent[-1][0]
 
 
-def test_a_waiting_job_goes_before_the_watch_cycle(bot, monkeypatch):
-    monkeypatch.setattr(avito, "Watch", lambda search: pytest.fail("checked while a job waits"))
-    monkeypatch.setattr(telegram_bot.avito_client, "CalmClient", lambda **kwargs: object())
-    bot.set_watch("phones-kazan", True)
-    bot.jobs.put(telegram_bot.Job("сбор", lambda: None))
-    bot.watch_cycle()
-    assert bot.watch_due == 0.0  # the cycle starts over right after the job
-
-
 def test_status_and_stop_know_about_watching(bot):
     bot.set_watch("disks-moskva", True)
     bot.handle(message("ℹ️ Что делаю"))
     assert "Слежу за: disks-moskva" in bot.notifier.sent[-1][0]
-    bot.current = telegram_bot.Job(telegram_bot.WATCH_JOB, lambda: None)
     bot.handle(message("⏹ Остановить"))
-    assert "проверка новых объявлений" in bot.notifier.sent[-1][0] and not bot.stop.is_set()
+    assert "Слежение не останавливаю" in bot.notifier.sent[-1][0] and not bot.stop.is_set()
     bot.handle(message("👀 Слежение"))
     assert bot.notifier.sent[-1][0].startswith("<b>Слежение</b>")
 
@@ -220,3 +210,68 @@ def test_clear_removes_every_search_and_cancel_keeps_them(bot):
     bot.handle(callback("clearyes:", message_id=13))
     bot.jobs.get_nowait().run()
     assert telegram_bot.search_names() == [] and "Список поисков пуст" in bot.notifier.sent[-1][0]
+
+
+def test_scan_and_watch_saves_keep_each_others_listings(tmp_path, monkeypatch):
+    monkeypatch.setattr(avito, "DATA_DIR", tmp_path)
+    search = avito.Search(name="s", title="s", profile="goods", catalog_url="https://www.avito.ru/moskva/x", params={})
+    search.save_collected({"1": {"id": 1, "price": 10}}, {"1": "10:00"})        # the scan, page 1
+    search.save_collected({"2": {"id": 2}}, {"2": "10:01", "1": "10:05"})        # a watch check in between
+    search.save_collected({"1": {"id": 1, "price": 9}, "3": {"id": 3}}, {"1": "10:00", "3": "10:02"})  # the scan, page 2
+    assert search.load("listings.json") == {"1": {"id": 1, "price": 9}, "2": {"id": 2}, "3": {"id": 3}}
+    assert search.load("seen.json") == {"1": "10:00", "2": "10:01", "3": "10:02"}
+
+
+def test_jobs_go_through_the_proxy_and_watch_checks_from_this_server(bot, monkeypatch):
+    monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
+    bot.scan_proxy = "socks5h://127.0.0.1:1080"
+    client, via_proxy = bot.job_client()
+    assert via_proxy and client.proxy == bot.scan_proxy and client.pacer is not bot.pacer  # a pace of its own
+    bot.watch_cycle()
+    assert bot.watch_client.proxy is None and bot.watch_client.pacer is bot.pacer
+
+    monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: False)
+    bot._job_clients.clear()
+    client, via_proxy = bot.job_client()
+    assert not via_proxy and client.pacer is bot.pacer  # the same address: the same pace as the checks
+    assert "Второй сервер для сбора недоступен" in bot.notifier.sent[-1][0]
+
+
+def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatch, tmp_path):
+    monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
+    bot.scan_proxy = "socks5h://127.0.0.1:1080"
+    table = tmp_path / "t.xlsx"
+    table.write_bytes(b"xlsx")
+    calls = []
+
+    def fake_scan(search, *, delay, log, client=None):  # like avito.scan_search: a stop still writes the table
+        calls.append(client.proxy)
+        try:
+            log("PAGE", search=search.name, page=len(calls), items=50, new=50, total=100)
+            if client.proxy:
+                client.log("IP-BLOCK", reason="captcha", wait_min=10)
+        except avito.ScanStopped:
+            log("ERROR", search=search.name, page=1, error="остановлено; следующий scan продолжит с этой страницы")
+        log("TABLE", search=search.name, path=str(table), объявлений=100)
+        return table
+
+    monkeypatch.setattr(avito, "scan_search", fake_scan)
+    bot.scan("disks-moskva")
+    assert calls == [bot.scan_proxy, None]
+    assert any("Второй сервер для сбора недоступен" in text for text, _ in bot.notifier.sent)
+    path, caption = bot.notifier.documents[0]
+    assert path == table and "сбор прерван" not in caption
+    assert not bot.proxy_usable()  # retried later, not on every job
+
+
+def test_clients_from_one_address_share_one_pace(monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(telegram_bot.avito_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(telegram_bot.avito_client.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    monkeypatch.setattr(telegram_bot.avito_client.random, "uniform", lambda a, b: 1.0)
+    pacer = telegram_bot.avito_client.Pacer(30)
+    starts = []
+    for _ in range(3):
+        pacer.wait()  # a scan and a watch check taking turns
+        starts.append(clock["now"])
+    assert starts == [1000.0, 1030.0, 1060.0]

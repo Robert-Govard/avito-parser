@@ -26,6 +26,7 @@ import logging
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,6 +69,9 @@ WATCH_SPEEDS = (
 load_json = apartments.load_seen
 save_json = apartments.save_json
 JSON_OUTPUT = False
+# Search.save_collected reads, merges and writes; the bot's scan and watch
+# threads may do that for the same search at the same moment.
+_SAVE_LOCK = threading.Lock()
 
 
 def _alert_text(f: dict[str, Any]) -> str:
@@ -178,6 +182,23 @@ class Search:
     def save(self, file: str, data: dict[str, Any]) -> None:
         save_json(self.path(file), data)
 
+    def save_collected(self, base: dict[str, Any], seen: dict[str, str]) -> None:
+        """Add listings to what is stored instead of replacing it.
+
+        The Telegram bot checks a search for new listings between the pages of
+        its scan; each keeps its own copy in memory, and each save must keep
+        what the other has stored. Listings take the newer data, seen keeps
+        the first time a listing was seen.
+        """
+        with _SAVE_LOCK:
+            stored = self.load("listings.json")
+            stored.update(base)
+            save_json(self.path("listings.json"), stored)
+            first_seen = self.load("seen.json")
+            for key, stamp in seen.items():
+                first_seen.setdefault(key, stamp)
+            save_json(self.path("seen.json"), first_seen)
+
 
 def load_search(name: str) -> Search:
     path = SEARCHES_DIR / f"{name}.json"
@@ -285,6 +306,7 @@ def add_search(
     dry_run: bool = False,
     delay: float = 5.0,
     log: Any = None,
+    client: avito_client.CalmClient | None = None,
 ) -> tuple[str, link_resolver.ResolvedSearch]:
     """Check an Avito search link on Avito and save it; SearchError if that fails."""
     name = name or suggested_name(url)
@@ -293,7 +315,7 @@ def add_search(
     if (SEARCHES_DIR / f"{name}.json").exists() and not replace:
         raise SearchError(f"поиск «{name}» уже есть; другое имя: --name, перезаписать: --replace")
     cache = load_json(LOCATIONS_CACHE)
-    client = avito_client.CalmClient(delay=delay, log=log or say)
+    client = client or avito_client.CalmClient(delay=delay, log=log or say)
     try:
         resolved = link_resolver.resolve(client, url, locations_cache=cache, city=city, profile=profile)
     except link_resolver.LinkError as exc:
@@ -375,8 +397,12 @@ def scan_search(
     max_pages: int = MAX_PAGES,
     delay: float = avito_client.DEFAULT_DELAY_SECONDS,
     log: Any = None,
+    client: avito_client.CalmClient | None = None,
 ) -> Path | None:
     """Collect the search page by page, then write its table (None if nothing is stored).
+
+    ``client`` lets a caller share one pace of requests between this scan and
+    other work (the Telegram bot's watch checks).
 
     A stopped or failed scan keeps what it has collected, writes the table
     anyway, and the next scan continues from the page it stopped at.
@@ -387,7 +413,7 @@ def scan_search(
     seen = search.load("seen.json")
     seen_before = dict(seen)
     base = search.load("listings.json")
-    client = avito_client.CalmClient(delay=delay, log=say_)
+    client = client or avito_client.CalmClient(delay=delay, log=say_)
     say_("SCAN", search=search.name, start_page=start)
     last_page = min(start + max_pages - 1, MAX_PAGES)
     number = start
@@ -402,8 +428,7 @@ def scan_search(
                 if key not in seen:
                     seen[key] = stamp
                     new += 1
-            search.save("listings.json", base)
-            search.save("seen.json", seen)
+            search.save_collected(base, seen)
             complete = page.is_last or number >= MAX_PAGES
             search.save("state.json", {"complete": complete, "next_page": 1 if complete else number + 1})
             say_("PAGE", search=search.name, page=number, items=len(page.items), new=new, total=page.total_count)
@@ -479,8 +504,7 @@ class Watch:
                 say_("ALERT", **fields)
                 on_alert(fields)
         if changed:
-            search.save("listings.json", base)
-            search.save("seen.json", seen)
+            search.save_collected(base, seen)
         if first_pass:
             self.primed = True
             say_("PRIMED", search=search.name, remembered=remembered)
@@ -564,7 +588,7 @@ def cmd_bot(args: argparse.Namespace) -> None:
     import telegram_bot
 
     try:
-        telegram_bot.run(delay=args.delay, watch_interval=args.watch_interval)
+        telegram_bot.run(delay=args.delay, watch_interval=args.watch_interval, scan_proxy=args.scan_proxy)
     except telegram_notify.TelegramError as exc:
         fail(str(exc))
     except KeyboardInterrupt:
@@ -642,6 +666,8 @@ def main_cli(argv: list[str] | None = None) -> None:
     bot = sub.add_parser("bot", help="принимать команды из Telegram: ссылка → сбор → таблица Excel в чат")
     bot.add_argument("--delay", type=float, default=avito_client.DEFAULT_DELAY_SECONDS)
     bot.add_argument("--watch-interval", type=float, default=60, help="секунд между проверками новых объявлений")
+    bot.add_argument("--scan-proxy", help="прокси для сборов, напр. socks5h://127.0.0.1:1080 (SSH-туннель на другой сервер), "
+                                         "чтобы сбор не делил лимит запросов со слежением")
     bot.set_defaults(func=cmd_bot)
 
     args = parser.parse_args(argv)

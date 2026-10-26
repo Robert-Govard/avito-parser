@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -92,6 +93,30 @@ def pow_source(response: Any, session: Any) -> Any:
     return _ChallengeFromCookie(challenge) if challenge else response
 
 
+class Pacer:
+    """The pause between requests from one IP address.
+
+    Avito limits an address, not a session, so clients that leave through the
+    same address (the Telegram bot's watch checks and its scans) share one
+    Pacer and wait for each other; a client behind a proxy gets its own.
+    """
+
+    def __init__(self, delay: float = DEFAULT_DELAY_SECONDS) -> None:
+        self.delay = delay
+        self.last_request = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            wait = self.delay * random.uniform(0.7, 1.3) - (time.monotonic() - self.last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self.last_request = time.monotonic()  # taken: a client in another thread waits from here
+
+    def done(self) -> None:
+        self.last_request = time.monotonic()
+
+
 class CalmClient:
     """One Avito session at a time, replaced whenever a captcha appears."""
 
@@ -100,20 +125,28 @@ class CalmClient:
         *,
         delay: float = DEFAULT_DELAY_SECONDS,
         log: Callable[..., None] | None = None,
+        pacer: Pacer | None = None,
+        proxy: str | None = None,
     ) -> None:
         for variable in main.PROXY_ENVIRONMENT_VARIABLES:
             os.environ.pop(variable, None)
-        self.delay = delay
+        self.pacer = pacer or Pacer(delay)
+        self.proxy = proxy  # e.g. socks5h://127.0.0.1:1080; never taken from the environment
         self.log = log or (lambda kind, **fields: None)
         self.session: Any | None = None
         self.referer: str | None = None
-        self.last_request = 0.0
         self.sessions_opened = 0
 
+    @property
+    def delay(self) -> float:
+        return self.pacer.delay
+
+    @property
+    def last_request(self) -> float:
+        return self.pacer.last_request
+
     def _pause(self) -> None:
-        wait = self.delay * random.uniform(0.7, 1.3) - (time.monotonic() - self.last_request)
-        if wait > 0:
-            time.sleep(wait)
+        self.pacer.wait()
 
     def _solve_captcha(self, response: Any) -> bool:
         """Solve the captcha in the current session; False if it did not pass."""
@@ -145,7 +178,7 @@ class CalmClient:
                 context="calm-client",
                 stream_response_body=True,
             )
-            self.last_request = time.monotonic()
+            self.pacer.done()
             kind = response_kind(response)
             if kind == "captcha":
                 captchas += 1
@@ -163,6 +196,7 @@ class CalmClient:
             self.session = main.requests.Session(
                 impersonate=main.HTTP_IMPERSONATE_PROFILE,
                 trust_env=False,
+                **({"proxy": self.proxy} if self.proxy else {}),
             )
             main.set_session_headers(self.session, {**main.REQUEST_HEADERS, "Referer": catalog_url})
             self.referer = catalog_url
