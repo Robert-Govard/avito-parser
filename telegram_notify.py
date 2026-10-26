@@ -169,6 +169,52 @@ class Notifier:
             if "message is not modified" not in str(exc):
                 raise
 
+    def send_screen(self, screen: Any) -> int | None:
+        """A tg_ui.Screen as a rich message; plain text if Telegram refuses it. Returns its id."""
+        markup = screen.markup()
+        payload: dict[str, Any] = {"chat_id": self.chat_id, "rich_message": {"html": screen.html}}
+        if markup:
+            payload["reply_markup"] = markup
+        try:
+            return int(call(self.token, "sendRichMessage", payload)["message_id"])
+        except TelegramNetworkError:
+            raise
+        except TelegramError as exc:
+            if "Telegram ответил 4" not in str(exc):
+                raise
+        return self._send_plain(screen.text, markup)
+
+    def _send_plain(self, text: str, markup: dict[str, Any] | None) -> int | None:
+        from tg_ui import split_message
+
+        message_id = None
+        chunks = split_message(text)
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk, "disable_web_page_preview": True}
+            if markup and index == len(chunks) - 1:
+                payload["reply_markup"] = markup
+            message_id = int(call(self.token, "sendMessage", payload)["message_id"])
+        return message_id
+
+    def edit_screen(self, message_id: int, screen: Any) -> bool:
+        """Redraw a rich message in place; False if it cannot be edited (deleted, too old, not rich)."""
+        payload: dict[str, Any] = {"chat_id": self.chat_id, "message_id": message_id,
+                                   "rich_message": {"html": screen.html},
+                                   "reply_markup": screen.markup() or {"inline_keyboard": []}}
+        try:
+            call(self.token, "editMessageText", payload)
+            return True
+        except TelegramNetworkError:
+            raise
+        except TelegramError as exc:
+            return "message is not modified" in str(exc)
+
+    def delete(self, message_id: int) -> None:
+        try:
+            call(self.token, "deleteMessage", {"chat_id": self.chat_id, "message_id": message_id})
+        except TelegramError:
+            pass  # already gone, or older than 48 hours
+
     def send_document(self, path: Path, caption: str = "") -> None:
         call(self.token, "sendDocument", {"chat_id": str(self.chat_id), "caption": caption, "parse_mode": "HTML"},
              file=("document", path), timeout=120)

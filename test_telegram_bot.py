@@ -5,6 +5,8 @@ import pytest
 import avito
 import telegram_bot
 import telegram_notify
+import tg_screens
+import tg_ui
 
 CHAT = 42
 
@@ -14,17 +16,25 @@ class FakeNotifier:
     chat_id = CHAT
 
     def __init__(self):
-        self.sent, self.edits, self.documents = [], [], []
+        self.sent, self.edits, self.deleted, self.documents = [], [], [], []
 
-    def send(self, text, *, preview=True, **extra):
-        self.sent.append((text, extra))
-        return len(self.sent)
+    def send_screen(self, screen):
+        self.sent.append(screen)
+        return 100 + len(self.sent)
 
-    def edit(self, message_id, text, **extra):
-        self.edits.append((message_id, text))
+    def edit_screen(self, message_id, screen):
+        self.edits.append((message_id, screen))
+        return True
+
+    def delete(self, message_id):
+        self.deleted.append(message_id)
 
     def send_document(self, path, caption=""):
         self.documents.append((path, caption))
+
+    @property
+    def last(self):
+        return self.sent[-1].text
 
 
 @pytest.fixture
@@ -46,38 +56,77 @@ def message(text, chat=CHAT):
     return {"update_id": 1, "message": {"chat": {"id": chat}, "text": text}}
 
 
+def callback(data, message_id=9, text="", chat=CHAT):
+    return {"update_id": 5, "callback_query": {"id": "q", "data": data,
+                                               "message": {"chat": {"id": chat}, "message_id": message_id, "text": text}}}
+
+
+def data_of(screen):
+    return [button.data for row in screen.rows for button in row]
+
+
+# --- access, panel ----------------------------------------------------------
+
 def test_other_chats_are_ignored(bot):
-    bot.handle(message("/list", chat=7))
+    bot.handle(message("/start", chat=7))
     bot.handle(message("https://www.avito.ru/moskva/x", chat=7))
-    assert bot.notifier.sent == [] and bot.jobs.empty()
+    bot.handle(callback("delyes:disks-moskva", chat=7))
+    assert bot.notifier.sent == [] and bot.jobs.empty() and telegram_bot.search_names() == ["disks-moskva", "phones-kazan"]
+
+
+def test_one_panel_in_the_chat_redrawn_in_place(bot):
+    bot.handle(message("/start"))
+    first = bot.panel_id
+    assert "Авито-поиски" in bot.notifier.last and "Поисков · 2" in bot.notifier.last
+    assert data_of(bot.notifier.sent[-1])[:4] == ["list:", "watching:", "new:", "help:"]
+
+    bot.handle(callback("list:", message_id=first))  # a button: the same message is redrawn
+    assert bot.notifier.edits[-1][0] == first and "Мои поиски · 2" in bot.notifier.edits[-1][1].text
+    assert len(bot.notifier.sent) == 1
+
+    bot.handle(message("/start"))  # a typed command: a new panel, the old one goes
+    assert bot.panel_id != first and bot.notifier.deleted == [first]
+
+
+def test_menu_offers_stop_only_while_collecting(bot):
+    stop = bot.menu_screen().rows[2][0]
+    assert stop.disabled and stop.to_api() == {"text": "Сбор не идёт", "icon_custom_emoji_id": tg_ui.STOP.id,
+                                               "disabled": {}}
+    bot.current = telegram_bot.Job("сбор «disks-moskva»", lambda: None)
+    stop = bot.menu_screen().rows[2][0]
+    assert stop.data == "stop:" and stop.style == tg_ui.DANGER and "сбор «disks-moskva»" in bot.menu_screen().text
+
+
+def test_buttons_of_the_old_keyboard_still_work(bot):
+    bot.handle(message("📋 Мои поиски"))
+    assert "Мои поиски · 2" in bot.notifier.last
+    bot.handle(message("ℹ️ Что делаю"))
+    assert "Авито-поиски" in bot.notifier.last
+
+
+# --- searches and jobs -------------------------------------------------------
+
+def test_list_opens_a_card_with_the_search_actions(bot):
+    screen = tg_screens.searches(bot.infos())
+    assert data_of(screen)[:2] == ["card:disks-moskva", "card:phones-kazan"] and "clear:" in data_of(screen)
+    bot.handle(callback("card:disks-moskva"))
+    card = bot.notifier.edits[-1][1]
+    assert data_of(card)[:4] == ["scan:disks-moskva", "table:disks-moskva", "watch:disks-moskva", "delete:disks-moskva"]
+    assert "ещё не собирали" in card.text and card.rows[0][0].text == "Собрать"
 
 
 def test_link_and_commands_queue_jobs(bot):
     bot.handle(message("вот https://www.avito.ru/moskva/tovary?q=hdd."))
     bot.handle(message("/scan 2"))
-    bot.handle({"update_id": 2, "callback_query": {"id": "q", "data": "table:disks-moskva",
-                                                    "message": {"chat": {"id": CHAT}}}})
+    bot.handle(callback("table:disks-moskva"))
     titles = [bot.jobs.get_nowait().title for _ in range(3)]
-    assert titles == ["ссылка", "сбор «phones-kazan»", "таблица «disks-moskva»"]
+    assert titles == ["проверка ссылки", "сбор «phones-kazan»", "таблица «disks-moskva»"]
+    assert "Поставил в очередь, перед ним 2" in bot.notifier.edits[-1][1].text
 
 
-def test_menu_buttons_run_their_commands(bot):
-    bot.handle(message("/start"))
-    assert bot.notifier.sent[0][1]["reply_markup"] == telegram_bot.KEYBOARD
-    bot.handle(message("📋 Мои поиски"))
-    assert "Мои поиски" in bot.notifier.sent[1][0] and "inline_keyboard" in bot.notifier.sent[1][1]["reply_markup"]
-    bot.handle(message("🔗 Новый поиск"))
-    assert "пришлите её сюда" in bot.notifier.sent[2][0]
-    bot.handle(message("⏹ Остановить"))
-    assert bot.notifier.sent[3][0] == "Нечего останавливать."
-    assert set(telegram_bot.BUTTONS) == {text for row in telegram_bot.MENU for text in row}
-
-
-def test_unknown_search_shows_the_list_with_buttons(bot):
+def test_unknown_search_shows_the_list(bot):
     bot.handle(message("/scan nope"))
-    assert "Нет поиска" in bot.notifier.sent[0][0]
-    keyboard = bot.notifier.sent[1][1]["reply_markup"]["inline_keyboard"]
-    assert keyboard[0][0]["callback_data"] == "scan:disks-moskva"
+    assert "Нет поиска «nope»" in bot.notifier.last and "Мои поиски · 2" in bot.notifier.last
 
 
 def test_known_link_is_scanned_not_added_again(bot, monkeypatch):
@@ -99,13 +148,18 @@ def test_scan_reports_pages_and_sends_the_table(bot, monkeypatch, tmp_path):
 
     monkeypatch.setattr(avito, "scan_search", fake_scan)
     bot.scan("disks-moskva")
-    assert any("стр. 1 из ~3 · собрано 50" in text for _, text in bot.notifier.edits)
+    progress = bot.notifier.sent[0]
+    assert data_of(progress) == ["stop:"]
+    page = next(screen.text for _, screen in bot.notifier.edits if "Страница" in screen.text)
+    assert "1 из ~3" in page and "50 объявлений" in page
+    done = bot.notifier.edits[-1][1]
+    assert "Готово" in done.text and not done.rows  # no stop button once done
     path, caption = bot.notifier.documents[0]
-    assert path == table and "объявлений: 50" in caption
+    assert path == table and "Объявлений: 50" in caption
 
 
 def test_stop_interrupts_at_the_next_event_once(bot):
-    progress = telegram_bot.Progress(bot, "head")
+    progress = telegram_bot.Progress(bot, "<h3>head</h3>")
     bot.stop.set()
     with pytest.raises(avito.ScanStopped):
         progress.log("PAGE", search="x", page=1, items=1, new=1, total=1)
@@ -113,29 +167,25 @@ def test_stop_interrupts_at_the_next_event_once(bot):
     assert progress.error == "остановлено"
 
 
-def test_document_upload_is_multipart_with_the_file(tmp_path):
-    path = tmp_path / "table.xlsx"
-    path.write_bytes(b"\x00binary")
-    body, content_type = telegram_notify._multipart({"chat_id": "42", "caption": "Таблица"}, "document", path)
-    boundary = content_type.split("boundary=")[1]
-    assert body.count(f"--{boundary}".encode()) == 4
-    assert b'name="document"; filename="table.xlsx"' in body and b"\x00binary" in body
-    assert "Таблица".encode() in body
+def test_stop_under_a_progress_message_answers_there_not_in_the_panel(bot):
+    bot.handle(message("/start"))
+    bot.current = telegram_bot.Job("сбор «disks-moskva»", lambda: None)
+    bot.handle(callback("stop:", message_id=555))
+    assert bot.stop.is_set() and "Останавливаю" in bot.notifier.last and bot.notifier.edits == []
 
 
-def test_watch_button_toggles_redraws_the_list_and_survives_restart(bot):
-    origin = {"message_id": 7, "text": "Мои поиски\n1. disks-moskva"}
-    bot.handle({"update_id": 3, "callback_query": {"id": "q", "data": "watch:disks-moskva",
-                                                    "message": {"chat": {"id": CHAT}, **origin}}})
-    assert bot.watching == {"disks-moskva"} and "Слежу за «disks-moskva»" in bot.notifier.sent[0][0]
-    message_id, text = bot.notifier.edits[-1]
-    assert message_id == 7 and "👀" in text
-    _, markup = bot.list_view()
-    assert markup["inline_keyboard"][0][2] == {"text": "🔕 Не следить", "callback_data": "unwatch:disks-moskva"}
+# --- watching ---------------------------------------------------------------
+
+def test_watch_from_the_card_redraws_it_and_survives_restart(bot):
+    bot.handle(callback("watch:disks-moskva", message_id=7))
+    assert bot.watching == {"disks-moskva"}
+    message_id, card = bot.notifier.edits[-1]
+    assert message_id == 7 and "Слежу за «disks-moskva»" in card.text
+    assert card.rows[1][0].data == "unwatch:disks-moskva" and "👀 включено" in card.text
     assert telegram_bot.Bot(FakeNotifier(), delay=0).watching == {"disks-moskva"}  # saved to disk
 
-    bot.handle(message("/unwatch 1"))
-    assert bot.watching == set() and "Больше не слежу" in bot.notifier.sent[-1][0]
+    bot.handle(callback("stopwatch:disks-moskva", message_id=8))  # from the watching screen
+    assert bot.watching == set() and "Ни за чем не слежу" in bot.notifier.edits[-1][1].text
     assert telegram_bot.Bot(FakeNotifier(), delay=0).watching == set()
 
 
@@ -159,74 +209,61 @@ def test_watch_cycle_primes_then_alerts_and_waits_for_the_interval(bot, monkeypa
     monkeypatch.setattr(telegram_bot.avito_client, "CalmClient", lambda **kwargs: object())
     bot.set_watch("phones-kazan", True)
     bot.watch_cycle()
-    assert checks == ["phones-kazan"] and "текущая выдача запомнена" in bot.notifier.sent[-1][0]
-    assert bot.watch_due > telegram_bot.time.monotonic() and bot.current is None
+    assert checks == ["phones-kazan"] and "текущая выдача запомнена" in bot.notifier.last
+    assert bot.watch_due > telegram_bot.time.monotonic()
     bot.watch_cycle()
-    assert 'href="https://www.avito.ru/x_1"' in bot.notifier.sent[-1][0]
+    alert = bot.notifier.sent[-1]
+    assert "iPhone" in alert.text and alert.rows[0][0].to_api()["url"] == "https://www.avito.ru/x_1"
 
 
-def test_status_and_stop_know_about_watching(bot):
+def test_stop_does_not_touch_watching(bot):
     bot.set_watch("disks-moskva", True)
-    bot.handle(message("ℹ️ Что делаю"))
-    assert "Слежу за: disks-moskva" in bot.notifier.sent[-1][0]
-    bot.handle(message("⏹ Остановить"))
-    assert "Слежение не останавливаю" in bot.notifier.sent[-1][0] and not bot.stop.is_set()
-    bot.handle(message("👀 Слежение"))
-    assert bot.notifier.sent[-1][0].startswith("<b>Слежение</b>")
+    bot.handle(message("/stop"))
+    assert "Слежение продолжается" in bot.notifier.last and not bot.stop.is_set()
+    bot.handle(message("/watching"))
+    assert "Слежение · 1" in bot.notifier.last and "disks-moskva" in bot.notifier.last
 
 
-def callback(data, message_id=9, text="Мои поиски"):
-    return {"update_id": 5, "callback_query": {"id": "q", "data": data,
-                                               "message": {"chat": {"id": CHAT}, "message_id": message_id, "text": text}}}
-
+# --- deleting -----------------------------------------------------------------
 
 def test_delete_asks_first_then_removes_the_search_its_data_and_watch(bot):
     (avito.DATA_DIR / "disks-moskva").mkdir(parents=True)
     (avito.DATA_DIR / "disks-moskva" / "listings.json").write_text("{}", encoding="utf-8")
     bot.set_watch("disks-moskva", True)
-    _, markup = bot.list_view()
-    assert markup["inline_keyboard"][0][3] == {"text": "🗑", "callback_data": "delete:disks-moskva"}
 
     bot.handle(callback("delete:disks-moskva"))
-    question, extra = bot.notifier.sent[-1]
-    assert "Удалить поиск «disks-moskva»" in question and telegram_bot.search_names() == ["disks-moskva", "phones-kazan"]
-    yes = extra["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    question = bot.notifier.edits[-1][1]
+    assert "Удалить «disks-moskva»?" in question.text
+    assert data_of(question) == ["delyes:disks-moskva", "card:disks-moskva"]  # «Отмена» goes back to the card
+    assert telegram_bot.search_names() == ["disks-moskva", "phones-kazan"]
 
-    bot.handle(callback(yes, message_id=11, text=question))
-    assert bot.notifier.edits[-1] == (11, "🗑 Удаляю «disks-moskva»…")
+    bot.handle(callback("delyes:disks-moskva", message_id=11))
+    assert bot.notifier.edits[-1][0] == 11 and "Удаляю «disks-moskva»" in bot.notifier.edits[-1][1].text
     bot.jobs.get_nowait().run()
     assert telegram_bot.search_names() == ["phones-kazan"]
     assert not (avito.DATA_DIR / "disks-moskva").exists() and bot.watching == set()
-    assert telegram_bot.load_watching() == set() and "Удалено" in bot.notifier.sent[-1][0]
+    assert telegram_bot.load_watching() == set() and "Удалено" in bot.notifier.last
 
 
-def test_clear_removes_every_search_and_cancel_keeps_them(bot):
+def test_clear_removes_every_search(bot):
     bot.handle(callback("clear:"))
-    assert "Удалить все поиски (2)" in bot.notifier.sent[-1][0]
-    bot.handle(callback("cancel:", message_id=12))
-    assert bot.notifier.edits[-1] == (12, "Отменено, ничего не удалял.") and len(telegram_bot.search_names()) == 2
-
-    bot.handle(message("/clear"))
+    question = bot.notifier.edits[-1][1]
+    assert "Удалить все поиски (2)?" in question.text and data_of(question) == ["clearyes:", "list:"]
     bot.handle(callback("clearyes:", message_id=13))
     bot.jobs.get_nowait().run()
-    assert telegram_bot.search_names() == [] and "Список поисков пуст" in bot.notifier.sent[-1][0]
+    assert telegram_bot.search_names() == []
+    bot.handle(message("/list"))
+    assert "Поисков пока нет" in bot.notifier.last
 
 
-def test_scan_and_watch_saves_keep_each_others_listings(tmp_path, monkeypatch):
-    monkeypatch.setattr(avito, "DATA_DIR", tmp_path)
-    search = avito.Search(name="s", title="s", profile="goods", catalog_url="https://www.avito.ru/moskva/x", params={})
-    search.save_collected({"1": {"id": 1, "price": 10}}, {"1": "10:00"})        # the scan, page 1
-    search.save_collected({"2": {"id": 2}}, {"2": "10:01", "1": "10:05"})        # a watch check in between
-    search.save_collected({"1": {"id": 1, "price": 9}, "3": {"id": 3}}, {"1": "10:00", "3": "10:02"})  # the scan, page 2
-    assert search.load("listings.json") == {"1": {"id": 1, "price": 9}, "2": {"id": 2}, "3": {"id": 3}}
-    assert search.load("seen.json") == {"1": "10:00", "2": "10:01", "3": "10:02"}
-
+# --- second server ------------------------------------------------------------
 
 def test_jobs_go_through_the_proxy_and_watch_checks_from_this_server(bot, monkeypatch):
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
     bot.scan_proxy = "socks5h://127.0.0.1:1080"
     client, via_proxy = bot.job_client()
     assert via_proxy and client.proxy == bot.scan_proxy and client.pacer is not bot.pacer  # a pace of its own
+    assert "через второй сервер" in bot.menu_screen().text
     bot.watch_cycle()
     assert bot.watch_client.proxy is None and bot.watch_client.pacer is bot.pacer
 
@@ -234,7 +271,8 @@ def test_jobs_go_through_the_proxy_and_watch_checks_from_this_server(bot, monkey
     bot._job_clients.clear()
     client, via_proxy = bot.job_client()
     assert not via_proxy and client.pacer is bot.pacer  # the same address: the same pace as the checks
-    assert "Второй сервер для сбора недоступен" in bot.notifier.sent[-1][0]
+    assert "Второй сервер для сбора недоступен" in bot.notifier.last
+    assert "Второй сервер недоступен" in bot.menu_screen().text
 
 
 def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatch, tmp_path):
@@ -258,9 +296,9 @@ def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatc
     monkeypatch.setattr(avito, "scan_search", fake_scan)
     bot.scan("disks-moskva")
     assert calls == [bot.scan_proxy, None]
-    assert any("Второй сервер для сбора недоступен" in text for text, _ in bot.notifier.sent)
+    assert any("Второй сервер для сбора недоступен" in screen.text for screen in bot.notifier.sent)
     path, caption = bot.notifier.documents[0]
-    assert path == table and "сбор прерван" not in caption
+    assert path == table and "прерван" not in bot.notifier.edits[-1][1].text
     assert not bot.proxy_usable()  # retried later, not on every job
 
 
@@ -275,3 +313,61 @@ def test_clients_from_one_address_share_one_pace(monkeypatch):
         pacer.wait()  # a scan and a watch check taking turns
         starts.append(clock["now"])
     assert starts == [1000.0, 1030.0, 1060.0]
+
+
+def test_scan_and_watch_saves_keep_each_others_listings(tmp_path, monkeypatch):
+    monkeypatch.setattr(avito, "DATA_DIR", tmp_path)
+    search = avito.Search(name="s", title="s", profile="goods", catalog_url="https://www.avito.ru/moskva/x", params={})
+    search.save_collected({"1": {"id": 1, "price": 10}}, {"1": "10:00"})        # the scan, page 1
+    search.save_collected({"2": {"id": 2}}, {"2": "10:01", "1": "10:05"})        # a watch check in between
+    search.save_collected({"1": {"id": 1, "price": 9}, "3": {"id": 3}}, {"1": "10:00", "3": "10:02"})  # the scan, page 2
+    assert search.load("listings.json") == {"1": {"id": 1, "price": 9}, "2": {"id": 2}, "3": {"id": 3}}
+    assert search.load("seen.json") == {"1": "10:00", "2": "10:01", "3": "10:02"}
+
+
+# --- Telegram plumbing ----------------------------------------------------------
+
+def test_document_upload_is_multipart_with_the_file(tmp_path):
+    path = tmp_path / "table.xlsx"
+    path.write_bytes(b"\x00binary")
+    body, content_type = telegram_notify._multipart({"chat_id": "42", "caption": "Таблица"}, "document", path)
+    boundary = content_type.split("boundary=")[1]
+    assert body.count(f"--{boundary}".encode()) == 4
+    assert b'name="document"; filename="table.xlsx"' in body and b"\x00binary" in body
+    assert "Таблица".encode() in body
+
+
+def test_a_refused_rich_message_goes_out_as_plain_text(monkeypatch):
+    calls = []
+
+    def fake_call(token, method, payload=None, **kwargs):
+        calls.append((method, payload))
+        if method == "sendRichMessage":
+            raise telegram_notify.TelegramError("Telegram ответил 400: Bad Request: can't parse rich message")
+        return {"message_id": 77}
+
+    monkeypatch.setattr(telegram_notify, "call", fake_call)
+    screen = tg_ui.Screen("<h3>Заголовок</h3><table><tr><td>Цена</td><td>1 ₽</td></tr></table>",
+                          ((tg_ui.Button("В меню", "menu:"),),))
+    assert telegram_notify.Notifier("t", 42).send_screen(screen) == 77
+    method, payload = calls[-1]
+    assert method == "sendMessage" and payload["text"] == "Заголовок\nЦена · 1 ₽"
+    assert payload["reply_markup"] == {"inline_keyboard": [[{"text": "В меню", "callback_data": "menu:"}]]}
+
+
+def test_buttons_and_plain_text_like_the_other_bot():
+    assert tg_ui.Button("Открыть", url="https://x", style=tg_ui.PRIMARY, icon=tg_ui.SEARCHES).to_api() == {
+        "text": "Открыть", "style": "primary", "icon_custom_emoji_id": tg_ui.SEARCHES.id, "url": "https://x"}
+    assert [tg_ui.plural(n, "поиск", "поиска", "поисков") for n in (1, 3, 5, 11, 21)] == [
+        "поиск", "поиска", "поисков", "поисков", "поиск"]
+    assert tg_ui.to_plain(f"<h2>{tg_ui.ce(tg_ui.STATS)} Меню</h2><p>a<br>b</p>") == "📊 Меню\na\nb"
+
+
+def test_a_flat_alert_carries_the_draft_and_the_link():
+    screen = tg_screens.alert("realty-owner", "flats-spb", {
+        "title": "2-к. квартира", "price": "12 000 000 ₽", "price_per_m2": "240 000 ₽", "address": "ул. Примерная, 1",
+        "metro": "Примерная", "verdict": "собственник", "reasons": ["пишет «собственник»"], "notes": [],
+        "published": "1 час назад", "url": "https://www.avito.ru/y_2", "draft": "Здравствуйте! <тест>",
+    })
+    assert "12 000 000 ₽" in screen.text and "Черновик" in screen.text and "&lt;тест&gt;" in screen.html
+    assert screen.rows[0][0].url == "https://www.avito.ru/y_2" and "#flats_spb" in screen.text

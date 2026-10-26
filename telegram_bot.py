@@ -3,18 +3,20 @@
     uv run python avito.py bot
 
 The bot answers only the chat saved by ``avito.py telegram setup``; everyone
-else is ignored. Jobs (add a link, collect, build a table) run one at a time
-in a background thread, so the bot keeps answering /status and /stop while a
-scan walks Avito at its calm pace. One status message is edited as pages come
-in; the finished table arrives as an .xlsx document.
+else is ignored. It looks like the owner's other bot: one "live" panel (menu,
+searches, a search's card, watching, help) redrawn in place as buttons are
+pressed, rich messages with coloured buttons (tg_ui, tg_screens). A job's
+progress is a message of its own, edited as pages come in, with a stop
+button; the finished table arrives as an .xlsx document.
 
-Watched searches ("👀 Следить") are checked about once a minute in a thread
-of their own: the first page of each, new listings sent to the chat like
-``avito.py watch`` does. The watch list survives restarts.
+Jobs (add a link, collect, build a table) run one at a time in a thread, so
+the bot keeps answering while a scan walks Avito at its calm pace. Watched
+searches are checked about once a minute in a thread of their own: the first
+page of each, new listings sent to the chat. The watch list survives restarts.
 
 Avito limits requests per IP address. Watch checks leave from this server;
-jobs (scans, adding a link) leave through ``--scan-proxy`` (an SSH tunnel to
-another server), so both run at full pace without waiting for each other.
+jobs leave through ``--scan-proxy`` (an SSH tunnel to another server,
+SSH-TUNNEL.md), so both run at full pace without waiting for each other.
 If the proxy is down or blocked, jobs fall back to this server's address
 and share its pace with the checks (avito_client.Pacer) until it is retried.
 Both threads add to a search's stored listings (Search.save_collected).
@@ -32,6 +34,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -39,7 +42,9 @@ from urllib.parse import urlsplit
 import avito
 import avito_client
 import telegram_notify
-from telegram_notify import TelegramError, TelegramNetworkError, esc
+import tg_screens as screens
+from telegram_notify import TelegramError, TelegramNetworkError
+from tg_ui import RUNNING, STATS, STOP, Screen, ce, esc, plural
 
 POLL_SECONDS = 50
 NETWORK_PAUSE_SECONDS = 10
@@ -48,9 +53,10 @@ WATCH_INTERVAL_SECONDS = 60
 WATCH_FAILURES_TO_REPORT = 3
 PROXY_RETRY_SECONDS = 30 * 60
 AVITO_LINK = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+")
-# Client events worth showing under the progress line.
+# Client events worth showing under a job's progress.
 NOTEWORTHY = {"CAPTCHA", "CAPTCHA-SOLVED", "CAPTCHA-FAILED", "SESSION-RESET", "IP-BLOCK", "NETWORK-WAIT", "ERROR"}
 COMMANDS = [
+    ("start", "меню"),
     ("list", "мои поиски"),
     ("scan", "собрать поиск: /scan имя или номер"),
     ("table", "прислать таблицу: /table имя или номер"),
@@ -59,44 +65,16 @@ COMMANDS = [
     ("watching", "за чем слежу"),
     ("delete", "удалить поиск: /delete имя или номер"),
     ("clear", "очистить весь список поисков"),
-    ("status", "что сейчас делаю"),
     ("stop", "остановить сбор"),
     ("help", "как пользоваться"),
 ]
-# The keyboard under the input field; a tap sends the button text.
-MENU = [["📋 Мои поиски", "🔗 Новый поиск"], ["👀 Слежение", "ℹ️ Что делаю"], ["⏹ Остановить", "❓ Помощь"]]
-BUTTONS = {
+# Texts of the reply keyboard earlier versions showed under the input field:
+# a tap on a button still left in a chat sends one of these.
+OLD_BUTTONS = {
     "📋 Мои поиски": "list", "🔗 Новый поиск": "new", "👀 Слежение": "watching",
-    "ℹ️ Что делаю": "status", "⏹ Остановить": "stop", "❓ Помощь": "help",
+    "ℹ️ Что делаю": "menu", "⏹ Остановить": "stop", "❓ Помощь": "help",
 }
-KEYBOARD = {"keyboard": [[{"text": text} for text in row] for row in MENU], "resize_keyboard": True,
-            "is_persistent": True}
-NEW_SEARCH = (
-    "Откройте поиск на Авито в браузере или приложении, выставьте город, категорию и фильтры, "
-    "скопируйте ссылку («Поделиться» → «Копировать») и пришлите её сюда."
-)
-HELP = (
-    "Пришлите ссылку на поиск Авито (откройте поиск в браузере, выставьте город и фильтры, скопируйте адрес) — "
-    "соберу все объявления и пришлю таблицу Excel.\n\n"
-    "Кнопки внизу: «Мои поиски» (у каждого — «собрать», «таблица», «следить»), «Новый поиск», "
-    "«Слежение», «Что делаю», «Остановить».\n\n"
-    "«👀 Следить» — раз в минуту смотрю свежие объявления поиска и присылаю сюда новые.\n\n"
-    "/list — мои поиски, с кнопками\n"
-    "/scan &lt;имя или номер&gt; — собрать поиск (досбор или заново)\n"
-    "/table &lt;имя или номер&gt; — таблица из уже собранного, без сбора\n"
-    "/watch, /unwatch &lt;имя или номер&gt; — следить за новыми или перестать\n"
-    "/delete &lt;имя или номер&gt; — удалить поиск, /clear — очистить весь список\n"
-    "/status — что сейчас делаю\n"
-    "/stop — остановить сбор (пришлю таблицу из того, что успел)\n\n"
-    "Сбор идёт спокойно, ~30 с на страницу из 50 объявлений, чтобы Авито не блокировал."
-)
-
-
-WATCH_HELP = (
-    "Раз в ~{minutes} мин смотрю первую страницу каждого поиска (сортировка «по дате») и присылаю сюда "
-    "объявления, которых раньше не было: для товаров — от частных лиц своего города, для квартир — "
-    "от собственников; выставленные за последние часы, без переопубликованных старых."
-)
+ARGUMENT_COMMANDS = ("scan", "table", "watch", "unwatch", "delete")
 
 
 @dataclass
@@ -110,7 +88,7 @@ def search_names() -> list[str]:
 
 
 def find_search(argument: str) -> str | None:
-    """A search by its name or by its number in /list."""
+    """A search by its name or by its number in the list."""
     names = search_names()
     argument = argument.strip()
     if argument.isdigit() and 1 <= int(argument) <= len(names):
@@ -146,6 +124,17 @@ def title_of(name: str) -> str:
         return name
 
 
+def new_today(name: str) -> int:
+    """Alerts sent today for a search (its alerts.jsonl)."""
+    path = avito.DATA_DIR / name / "alerts.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    today = date.today().isoformat()
+    return sum(line.startswith(f'{{"found": "{today}') for line in lines)
+
+
 class ProxyFailed(avito.ScanStopped):
     """The job's proxy went down or got blocked: stop, then go on without it."""
 
@@ -160,31 +149,28 @@ def proxy_reachable(proxy: str) -> bool:
 
 
 class Progress:
-    """The status message of one job and the ``log`` callback that edits it."""
+    """The progress message of one job and the ``log`` callback that redraws it."""
 
     def __init__(self, bot: "Bot", head: str) -> None:
         self.bot = bot
-        self.head = head
+        self.view = screens.ProgressView(head)
         self.via_proxy = False  # set by Bot.with_job_client
         self.proxy_failed = False
-        self.line = ""
-        self.event = ""
         self.collected = 0
         self.table: dict[str, Any] = {}
         self.error = ""
-        self.message_id = bot.say(head)
+        self.message_id = bot.send(screens.progress(self.view))
 
     def show(self) -> None:
         if self.message_id is None:
             return
-        text = "\n".join(part for part in (self.head, self.line, self.event) if part)
         try:
-            self.bot.notifier.edit(self.message_id, text)
+            self.bot.notifier.edit_screen(self.message_id, screens.progress(self.view))
         except TelegramError as exc:
             avito.say("TELEGRAM-ERROR", error=str(exc))
 
-    def set_head(self, head: str) -> None:
-        self.head, self.line, self.event = head, "", ""
+    def set_head(self, head: str, *, rows: list[tuple[str, str]] | None = None, stoppable: bool = True) -> None:
+        self.view = screens.ProgressView(head, rows or [], "", stoppable)
         self.show()
 
     def log(self, kind: str, **fields: Any) -> None:
@@ -201,16 +187,20 @@ class Progress:
             self.collected += int(fields.get("items") or 0)
             pages = min(max(1, math.ceil(int(fields.get("total") or 0) / avito_client.FULL_PAGE_SIZE)), avito.MAX_PAGES)
             left = max(0, pages - int(fields["page"]))
-            eta = f" · осталось ~{math.ceil(left * avito_client.DEFAULT_DELAY_SECONDS / 60)} мин" if left else ""
-            self.line = f"стр. {fields['page']} из ~{pages} · собрано {self.collected}{eta}"
-            self.event = ""
+            self.view.rows = [
+                ("Страница", f"<b>{fields['page']}</b> из ~{pages}"),
+                ("Собрано", f"{self.collected} {plural(self.collected, 'объявление', 'объявления', 'объявлений')}"),
+                ("Осталось", f"~{math.ceil(left * avito_client.DEFAULT_DELAY_SECONDS / 60)} мин" if left else "последняя"),
+                ("Идёт", "через второй сервер" if self.via_proxy else "с этого сервера"),
+            ]
+            self.view.event = ""
         elif kind == "TABLE":
             self.table = {k: v for k, v in fields.items() if k not in ("time", "search", "path")}
             return
         elif kind in NOTEWORTHY:
             if kind == "ERROR":
                 self.error = str(fields.get("error", ""))
-            self.event = esc(avito.HUMAN[kind](fields).strip())
+            self.view.event = avito.HUMAN[kind](fields).strip().lstrip("·").strip()
         else:
             return
         self.show()
@@ -230,6 +220,7 @@ class Bot:
         self.jobs: queue.Queue[Job] = queue.Queue()
         self.current: Job | None = None
         self.stop = threading.Event()
+        self.panel_id: int | None = None  # the "live" menu message
         self.watch_interval = watch_interval
         self.watching = load_watching()  # names; changed by the Telegram side, read by the watch thread
         self.watch_lock = threading.Lock()
@@ -248,14 +239,71 @@ class Bot:
         self.watch_client: avito_client.CalmClient | None = None
         self.cycles = 0
 
-    # --- Telegram side -------------------------------------------------
+    # --- sending ---------------------------------------------------------
 
-    def say(self, text: str, **extra: Any) -> int | None:
+    def send(self, screen: Screen) -> int | None:
         try:
-            return self.notifier.send(text, preview=False, **extra)
+            return self.notifier.send_screen(screen)
         except TelegramError as exc:
             avito.say("TELEGRAM-ERROR", error=str(exc))
             return None
+
+    def say(self, text: str, *rows: tuple) -> int | None:
+        """A short message; ``text`` is HTML, line breaks allowed."""
+        return self.send(Screen("<p>" + text.replace("\n", "<br>") + "</p>", tuple(rows)))
+
+    def show(self, screen: Screen, origin: dict[str, Any] | None = None) -> None:
+        """Show a panel screen: redraw the message a button was pressed in, or send a new panel."""
+        if origin and "message_id" in origin:
+            try:
+                if self.notifier.edit_screen(origin["message_id"], screen):
+                    self.panel_id = origin["message_id"]
+                    return
+            except TelegramError as exc:
+                avito.say("TELEGRAM-ERROR", error=str(exc))
+        previous = self.panel_id
+        self.panel_id = self.send(screen)
+        if previous is not None and previous != self.panel_id:
+            self.notifier.delete(previous)  # one panel in the chat, the newest
+
+    # --- views -------------------------------------------------------------
+
+    @property
+    def check_minutes(self) -> int:
+        """How often each watched search is looked at: the interval, or longer with many searches."""
+        cycle = max(self.watch_interval, len(self.watching) * self.delay)
+        return max(1, round(cycle / 60))
+
+    def info(self, name: str) -> screens.SearchInfo:
+        search = avito.load_search(name)
+        state = search.load("state.json")
+        return screens.SearchInfo(
+            name=name, title=search.title, profile=search.profile, url=search.catalog_url,
+            stored=len(search.load("seen.json")), complete=bool(state.get("complete")),
+            next_page=int(state.get("next_page", 1)), watched=name in self.watching,
+            new_today=new_today(name) if name in self.watching else 0,
+        )
+
+    def infos(self) -> list[screens.SearchInfo]:
+        return [self.info(name) for name in search_names()]
+
+    def route(self) -> str | None:
+        if not self.scan_proxy:
+            return None
+        return "proxy" if self.proxy_usable() else "direct"
+
+    def menu_screen(self) -> Screen:
+        items = self.infos()
+        return screens.menu(screens.MenuView(
+            searches=len(items), listings=sum(s.stored for s in items), watching=len(self.watching),
+            check_minutes=self.check_minutes, new_today=sum(s.new_today for s in items),
+            job=self.current.title if self.current else None, queued=self.jobs.qsize(), route=self.route(),
+        ))
+
+    def watching_screen(self) -> Screen:
+        return screens.watching([s for s in self.infos() if s.watched], self.check_minutes)
+
+    # --- Telegram side -----------------------------------------------------
 
     def run(self) -> None:
         token = self.notifier.token
@@ -271,8 +319,12 @@ class Bot:
             offset = backlog[-1]["update_id"] + 1
         threading.Thread(target=self.work, daemon=True).start()
         threading.Thread(target=self.watch_loop, daemon=True).start()
-        watching = f"\n\n👀 Слежу за: {esc(', '.join(title_of(n) for n in sorted(self.watching)))}" if self.watching else ""
-        self.say("🤖 Бот на связи.\n\n" + HELP + watching, reply_markup=KEYBOARD)
+        try:  # the old keyboard under the input field gives way to the panel
+            telegram_notify.call(token, "sendMessage", {"chat_id": self.notifier.chat_id, "text": "✅ Бот запущен",
+                                                        "reply_markup": {"remove_keyboard": True}})
+        except TelegramError as exc:
+            avito.say("TELEGRAM-ERROR", error=str(exc))
+        self.show(self.menu_screen())
         avito.say("BOT", text="бот запущен, жду команд в Telegram. Остановить: Ctrl+C")
         while True:
             try:
@@ -296,6 +348,8 @@ class Bot:
                     self.handle(update)
                 except TelegramError as exc:
                     avito.say("TELEGRAM-ERROR", error=str(exc))
+                except Exception:  # one bad update must not stop the bot
+                    traceback.print_exc()
 
     def handle(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -304,8 +358,8 @@ class Bot:
             telegram_notify.call(self.notifier.token, "answerCallbackQuery", {"callback_query_id": query["id"]})
             if chat != self.notifier.chat_id:
                 return
-            action, _, name = str(query.get("data", "")).partition(":")
-            self.command(action, name, origin=query.get("message"))
+            action, _, argument = str(query.get("data", "")).partition(":")
+            self.command(action, argument, origin=query.get("message"))
             return
         message = update.get("message") or {}
         if (message.get("chat") or {}).get("id") != self.notifier.chat_id:
@@ -314,119 +368,88 @@ class Bot:
             return
         text = str(message.get("text") or "").strip()
         link = AVITO_LINK.search(text)
-        if text in BUTTONS:
-            self.command(BUTTONS[text], "")
+        if text in OLD_BUTTONS:
+            self.command(OLD_BUTTONS[text], "")
         elif link:
-            self.enqueue(Job("ссылка", lambda: self.add_and_scan(link.group(0).rstrip(".,;)"))))
+            self.enqueue(Job("проверка ссылки", lambda: self.add_and_scan(link.group(0).rstrip(".,;)"))))
         elif text.startswith("/"):
             command, _, argument = text[1:].partition(" ")
             self.command(command.split("@")[0].lower(), argument)
         else:
-            self.say("Не понял. Пришлите ссылку на поиск Авито или /help.")
+            self.show(screens.new_search().with_notice(screens.notice(
+                "Не понял. Пришлите ссылку на поиск Авито — или выберите действие в меню.")))
 
     def command(self, command: str, argument: str, origin: dict[str, Any] | None = None) -> None:
-        if command in ("start", "help"):
-            self.say(HELP, reply_markup=KEYBOARD)
-        elif command == "new":
-            self.say(NEW_SEARCH)
+        argument = argument.strip()
+        if command in ("start", "menu", "status"):
+            self.show(self.menu_screen(), origin)
         elif command == "list":
-            self.send_list()
-        elif command == "status":
-            self.send_status()
+            self.show(screens.searches(self.infos()), origin)
         elif command == "watching":
-            text, markup = self.watching_view()
-            self.say(text, reply_markup=markup)
+            self.show(self.watching_screen(), origin)
+        elif command == "new":
+            self.show(screens.new_search(), origin)
+        elif command == "help":
+            self.show(screens.help_screen(self.check_minutes), origin)
+        elif command == "stop":
+            self.stop_jobs(origin)
         elif command == "clear":
-            self.confirm_delete(search_names(), origin)
+            names = search_names()
+            if names:
+                self.show(screens.confirm_delete(f"все поиски ({len(names)})", "clearyes:", "list:"), origin)
+            else:
+                self.show(screens.searches([]), origin)
         elif command == "clearyes":
             self.delete(search_names(), origin)
-        elif command == "delyes":
-            self.delete([argument] if argument in search_names() else [], origin)
-        elif command == "cancel":
-            self.close(origin, "Отменено, ничего не удалял.")
-        elif command == "stop":
-            self.stop_jobs()
-        elif command in ("scan", "table", "watch", "unwatch", "delete"):
-            names = search_names()
-            if argument.strip():
-                name = find_search(argument)
-            else:
-                name = names[0] if len(names) == 1 else None
+        elif command == "noop":
+            pass
+        elif command in ("card", "delyes", "stopwatch", *ARGUMENT_COMMANDS):
+            name = self.pick(argument, origin)
             if name is None:
-                if argument.strip():
-                    self.say(f"Нет поиска «{esc(argument.strip())}».")
-                self.send_list()
                 return
-            if command == "scan":
-                self.enqueue(Job(f"сбор «{name}»", lambda: self.scan(name)))
-            elif command == "table":
-                self.enqueue(Job(f"таблица «{name}»", lambda: self.table(name)))
+            if command == "card":
+                self.show(screens.card(self.info(name)), origin)
             elif command == "delete":
-                self.confirm_delete([name], origin)
+                self.show(screens.confirm_delete(f"«{title_of(name)}»", f"delyes:{name}", f"card:{name}"), origin)
+            elif command == "delyes":
+                self.delete([name], origin)
+            elif command == "stopwatch":
+                self.set_watch(name, False)
+                self.show(self.watching_screen(), origin)
+            elif command in ("watch", "unwatch"):
+                text = self.set_watch(name, command == "watch")
+                self.show(screens.card(self.info(name)).with_notice(screens.notice(text)), origin)
             else:
-                self.set_watch(name, command == "watch")
-                if origin:
-                    self.refresh(origin)
+                title = "сбор" if command == "scan" else "таблица"
+                ahead = self.enqueue(Job(f"{title} «{title_of(name)}»",
+                                         (lambda: self.scan(name)) if command == "scan" else (lambda: self.table(name))))
+                text = ("Собираю — ход сбора будет отдельным сообщением ниже." if command == "scan"
+                        else "Делаю таблицу — пришлю файлом ниже.")
+                if ahead:
+                    text = f"Поставил в очередь, перед ним {ahead}. " + text
+                self.show(screens.card(self.info(name)).with_notice(screens.notice(f"{ce(RUNNING)} {esc(text)}")),
+                          origin)
         else:
-            self.say("Не знаю такой команды. /help — что я умею.")
+            self.show(self.menu_screen().with_notice(screens.notice("Не знаю такой команды — вот меню.")))
 
-    def send_list(self) -> None:
-        if not search_names():
-            self.say("Поисков пока нет. Пришлите ссылку на поиск Авито.")
-            return
-        text, markup = self.list_view()
-        self.say(text, reply_markup=markup)
-
-    def list_view(self) -> tuple[str, dict[str, Any]]:
-        lines, keyboard = ["<b>Мои поиски</b>"], []
-        for number, name in enumerate(search_names(), start=1):
-            search = avito.load_search(name)
-            stored = len(search.load("listings.json"))
-            watched = name in self.watching
-            lines.append(f"{number}. {esc(search.title)} — {stored} объявл.{' 👀' if watched else ''} (<code>{esc(name)}</code>)")
-            if len(f"unwatch:{name}".encode()) <= 64:  # Telegram's callback_data limit
-                keyboard.append([
-                    {"text": f"📥 {number}. Собрать", "callback_data": f"scan:{name}"},
-                    {"text": "📊 Таблица", "callback_data": f"table:{name}"},
-                    {"text": "🔕 Не следить", "callback_data": f"unwatch:{name}"} if watched
-                    else {"text": "👀 Следить", "callback_data": f"watch:{name}"},
-                    {"text": "🗑", "callback_data": f"delete:{name}"},
-                ])
-        keyboard.append([{"text": "🗑 Очистить весь список", "callback_data": "clear:"}])
-        return "\n".join(lines), {"inline_keyboard": keyboard}
-
-    def confirm_delete(self, names: list[str], origin: dict[str, Any] | None) -> None:
-        if not names:
-            self.say("Поисков нет, удалять нечего.")
-            return
-        if len(names) == 1:
-            question = f"Удалить поиск «{esc(title_of(names[0]))}» вместе с собранными объявлениями?"
-            yes = f"delyes:{names[0]}"
-        else:
-            question = f"Удалить все поиски ({len(names)}) вместе с собранными объявлениями?"
-            yes = "clearyes:"
-        self.say(question + "\nТаблицы, которые я уже присылал, останутся у вас в чате.",
-                 reply_markup={"inline_keyboard": [[{"text": "🗑 Да, удалить", "callback_data": yes},
-                                                    {"text": "Отмена", "callback_data": "cancel:"}]]})
-
-    def close(self, origin: dict[str, Any] | None, text: str) -> None:
-        """Replace a question with its outcome, so its buttons cannot be pressed twice."""
-        if origin and "message_id" in origin:
-            try:
-                self.notifier.edit(origin["message_id"], text, reply_markup={"inline_keyboard": []})
-                return
-            except TelegramError as exc:
-                avito.say("TELEGRAM-ERROR", error=str(exc))
-        self.say(text)
+    def pick(self, argument: str, origin: dict[str, Any] | None) -> str | None:
+        """The search a command is about; the list (with a note) when there is none such."""
+        names = search_names()
+        name = find_search(argument) if argument else (names[0] if len(names) == 1 else None)
+        if name is None:
+            note = f"Нет поиска «{esc(argument)}»." if argument else "Выберите поиск."
+            self.show(screens.searches(self.infos()).with_notice(screens.notice(note)), origin)
+        return name
 
     def delete(self, names: list[str], origin: dict[str, Any] | None) -> None:
         if not names:
-            self.close(origin, "Этого поиска уже нет.")
+            self.show(screens.searches(self.infos()).with_notice(screens.notice("Этого поиска уже нет.")), origin)
             return
-        what = f"«{esc(title_of(names[0]))}»" if len(names) == 1 else f"все поиски ({len(names)})"
-        self.close(origin, f"🗑 Удаляю {what}…")
-        # Through the queue: never in the middle of a scan or a watch check of the same search.
-        self.enqueue(Job(f"удаление: {what}", lambda: self.remove(names, what)))
+        what = f"«{title_of(names[0])}»" if len(names) == 1 else f"все поиски ({len(names)})"
+        # Through the queue: never in the middle of a scan of the same search.
+        ahead = self.enqueue(Job(f"удаление: {what}", lambda: self.remove(names, what)))
+        note = f"🗑 Удаляю {esc(what)}" + (" — после текущего сбора." if ahead else "…")
+        self.show(screens.searches(self.infos()).with_notice(screens.notice(note)), origin)
 
     def remove(self, names: list[str], what: str) -> None:
         for name in names:
@@ -435,74 +458,34 @@ class Bot:
             self.announce.discard(name)
             avito.delete_search(name)
         self.save_watching()
-        self.say(f"🗑 Удалено: {what}." + ("" if search_names() else " Список поисков пуст — пришлите ссылку на новый."))
+        self.say(f"🗑 Удалено: {esc(what)}.", (screens.TO_LIST,))
 
-    def watching_view(self) -> tuple[str, dict[str, Any]]:
-        names = sorted(self.watching)
-        if not names:
-            return ("<b>Слежение</b>\nНи за чем не слежу. Откройте «📋 Мои поиски» и нажмите «👀 Следить» "
-                    "у нужного поиска."), {"inline_keyboard": []}
-        lines = ["<b>Слежение</b>", WATCH_HELP.format(minutes=max(1, round(self.watch_interval / 60))), ""]
-        keyboard = []
-        for number, name in enumerate(names, start=1):
-            title = title_of(name)
-            lines.append(f"{number}. {esc(title)}")
-            keyboard.append([{"text": f"🔕 Не следить: {title[:40]}", "callback_data": f"unwatch:{name}"}])
-        return "\n".join(lines), {"inline_keyboard": keyboard}
-
-    def refresh(self, origin: dict[str, Any]) -> None:
-        """Redraw the list a button was pressed in, so its buttons show the new state."""
-        view = self.watching_view if str(origin.get("text", "")).startswith("Слежение") else self.list_view
-        text, markup = view()
-        try:
-            self.notifier.edit(origin["message_id"], text, reply_markup=markup)
-        except (TelegramError, KeyError) as exc:
-            avito.say("TELEGRAM-ERROR", error=str(exc))
-
-    def set_watch(self, name: str, on: bool) -> None:
+    def set_watch(self, name: str, on: bool) -> str:
+        """Turn watching on or off; returns what happened (HTML)."""
         title = esc(title_of(name))
         if on and name not in self.watching:
             self.announce.add(name)
             with self.watch_lock:
                 self.watching.add(name)
             self.watch_due = 0.0
-            self.say(f"👀 Слежу за «{title}». Сначала запомню, что уже выставлено, дальше буду присылать сюда "
-                     f"новые объявления.\n\n" + WATCH_HELP.format(minutes=max(1, round(self.watch_interval / 60))))
+            text = f"👀 Слежу за «{title}». Сначала запомню то, что уже выставлено, дальше пришлю сюда новые."
         elif on:
-            self.say(f"Уже слежу за «{title}».")
+            text = f"Уже слежу за «{title}»."
         elif name in self.watching:
             with self.watch_lock:
                 self.watching.discard(name)
             self.announce.discard(name)
-            self.say(f"🔕 Больше не слежу за «{title}».")
+            text = f"Больше не слежу за «{title}»."
         else:
-            self.say(f"За «{title}» я и не следил.")
+            text = f"За «{title}» я и не следил."
         self.save_watching()
+        return text
 
     def save_watching(self) -> None:
         with self.watch_lock:
             avito.save_json(watching_path(), {"searches": sorted(self.watching)})
 
-    def send_status(self) -> None:
-        lines = []
-        if self.current is None:
-            lines.append("Сейчас ничего не делаю.")
-        else:
-            lines.append(f"Сейчас: {esc(self.current.title)}")
-            if self.jobs.qsize():
-                lines.append(f"В очереди: {self.jobs.qsize()}")
-        if self.watching:
-            wait = round(self.watch_due - time.monotonic())
-            lines.append(f"👀 Слежу за: {esc(', '.join(title_of(n) for n in sorted(self.watching)))}"
-                         + (f"; следующая проверка через ~{wait} с" if wait > 0 else "; проверяю сейчас"))
-        elif self.current is None:
-            lines.append("Пришлите ссылку или откройте «📋 Мои поиски».")
-        if self.scan_proxy:
-            lines.append("Сбор идёт через второй сервер, слежение ему не мешает." if self.proxy_usable()
-                         else "Второй сервер сейчас недоступен: сбор идёт отсюда, вперемешку со слежением.")
-        self.say("\n".join(lines))
-
-    def stop_jobs(self) -> None:
+    def stop_jobs(self, origin: dict[str, Any] | None = None) -> None:
         dropped = 0
         while True:
             try:
@@ -511,18 +494,23 @@ class Bot:
             except queue.Empty:
                 break
         if self.current is None:
-            self.say(("Нечего останавливать." if not dropped else f"Очередь очищена ({dropped}).")
-                     + (" Слежение не останавливаю — его выключает кнопка «👀 Слежение»." if self.watching else ""))
-            return
-        self.stop.set()
-        self.say("Останавливаю после текущего запроса к Авито…"
-                 + (f" Очередь очищена ({dropped})." if dropped else ""))
+            note = "Сбор не идёт." if not dropped else f"Очередь очищена ({dropped})."
+        else:
+            self.stop.set()
+            note = "Останавливаю после текущего запроса к Авито, таблицу из собранного пришлю." + (
+                f" Очередь очищена ({dropped})." if dropped else "")
+        if self.watching:
+            note += " Слежение продолжается — выключается в «Слежении»."
+        if origin and origin.get("message_id") not in (None, self.panel_id):
+            self.say(note)  # pressed under a job's progress: the panel stays where it is
+        else:
+            self.show(self.menu_screen().with_notice(screens.notice(esc(note))), origin)
 
-    def enqueue(self, job: Job) -> None:
+    def enqueue(self, job: Job) -> int:
+        """Queue a job; returns how many are ahead of it."""
         ahead = self.jobs.qsize() + (self.current is not None)
         self.jobs.put(job)
-        if ahead:
-            self.say(f"Поставил в очередь: {esc(job.title)} (перед ним {ahead}).")
+        return ahead
 
     # --- job thread ----------------------------------------------------
 
@@ -536,9 +524,9 @@ class Bot:
             except avito.ScanStopped:
                 self.say("⏹ Остановлено.")
             except avito.SearchError as exc:
-                self.say(f"✗ {esc(exc)}")
+                self.say(f"{ce(STOP)} {esc(exc)}", (screens.TO_MENU,))
             except SystemExit:
-                self.say("✗ Не получилось, подробности в окне программы.")
+                self.say("✗ Не получилось, подробности в журнале бота.")
             except Exception as exc:  # the bot must outlive any single job
                 traceback.print_exc()
                 self.say(f"✗ Ошибка: {esc(type(exc).__name__)}: {esc(str(exc)[:300])}")
@@ -552,7 +540,7 @@ class Bot:
     def proxy_down(self, reason: str) -> None:
         self.proxy_off_until = time.monotonic() + PROXY_RETRY_SECONDS
         self._job_clients.pop(True, None)  # a fresh session next time
-        self.say(f"⚠ Второй сервер для сбора недоступен ({esc(reason)}). Собираю отсюда, вперемешку со слежением; "
+        self.say(f"⚠️ Второй сервер для сбора недоступен ({esc(reason)}). Собираю отсюда, вперемешку со слежением; "
                  f"попробую снова через {PROXY_RETRY_SECONDS // 60} мин.")
 
     def job_client(self) -> tuple[avito_client.CalmClient, bool]:
@@ -573,7 +561,7 @@ class Bot:
         while True:
             client, progress.via_proxy = self.job_client()
             progress.proxy_failed = False
-            client.log = progress.log  # captchas and blocks show in the job's status
+            client.log = progress.log  # captchas and blocks show in the job's progress
             try:
                 result = action(client)
             except ProxyFailed:
@@ -583,8 +571,57 @@ class Bot:
             if not progress.proxy_failed:
                 return result
             progress.error = ""  # the scan stopped only to switch; it goes on below
-            progress.event = "↪ второй сервер недоступен, продолжаю отсюда"
+            progress.view.event = "↪ второй сервер недоступен, продолжаю отсюда"
             progress.show()
+
+    def add_and_scan(self, url: str) -> None:
+        existing = search_for_link(url)
+        if existing:
+            self.say(f"Этот поиск уже есть — «{esc(title_of(existing))}», собираю его.")
+            self.scan(existing)
+            return
+        progress = Progress(self, f"<h3>{ce(RUNNING)} Проверяю ссылку на Авито</h3><p>Около минуты…</p>")
+        name, resolved = self.with_job_client(
+            progress, lambda client: avito.add_search(url, log=progress.log, client=client)
+        )
+        rows = [("Город", esc(resolved.city)), ("Объявлений сейчас", str(resolved.total))]
+        if resolved.filters:
+            rows.append(("Фильтры", esc("; ".join(resolved.filters))))
+        head = f"<h3>✅ Поиск сохранён: {esc(resolved.title)}</h3>"
+        if resolved.warnings:
+            head += "".join(f"<p>⚠️ {esc(warning)}</p>" for warning in resolved.warnings)
+        progress.set_head(head, rows=rows, stoppable=False)
+        if resolved.total == 0:
+            self.say("⚠️ По этой ссылке сейчас 0 объявлений, собирать нечего. Проверьте ссылку в браузере.")
+            return
+        self.scan(name)
+
+    def scan(self, name: str) -> None:
+        search = avito.load_search(name)
+        progress = Progress(self, f"<h3>{ce(RUNNING)} Собираю «{esc(search.title)}»</h3>")
+        path = self.with_job_client(
+            progress, lambda client: avito.scan_search(search, delay=self.delay, log=progress.log, client=client)
+        )
+        self.send_table(search, path, progress)
+
+    def table(self, name: str) -> None:
+        search = avito.load_search(name)
+        progress = Progress(self, f"<h3>{ce(STATS)} Делаю таблицу «{esc(search.title)}»</h3>")
+        path = avito.write_table(search, search.load("seen.json"), log=progress.log)
+        self.send_table(search, path, progress)
+
+    def send_table(self, search: avito.Search, path: Path | None, progress: Progress) -> None:
+        if path is None:
+            progress.set_head(f"<h3>В базе «{esc(search.title)}» пока пусто</h3><p>Сначала соберите объявления.</p>",
+                              stoppable=False)
+            return
+        rows = [(esc(key).capitalize(), esc(value)) for key, value in progress.table.items()]
+        head = f"<h3>✅ Готово: {esc(search.title)}</h3>"
+        if progress.error:
+            head += f"<p>⚠️ Сбор прерван ({esc(progress.error[:200])}); «Собрать» продолжит с той же страницы.</p>"
+        progress.set_head(head + "<p>Таблица — следующим сообщением.</p>", rows=rows, stoppable=False)
+        caption = [f"📊 <b>{esc(search.title)}</b>"] + [f"{label}: {value}" for label, value in rows]
+        self.notifier.send_document(path, caption="\n".join(caption)[:1024])
 
     # --- watch thread --------------------------------------------------
 
@@ -640,62 +677,13 @@ class Bot:
             avito.say("ERROR", search=name, error=error)
             self.failures[name] = self.failures.get(name, 0) + 1
             if self.failures[name] == WATCH_FAILURES_TO_REPORT:
-                self.say(f"⚠ Не получается проверить «{esc(search.title)}» ({esc(error)}). Продолжаю пробовать.")
+                self.say(f"⚠️ Не получается проверить «{esc(search.title)}» ({esc(error)}). Продолжаю пробовать.")
         if name in self.announce and watch.primed:
             self.announce.discard(name)
-            self.say(f"✓ «{esc(search.title)}»: текущая выдача запомнена. Новые объявления пришлю сюда.")
+            self.say(f"✅ «{esc(search.title)}»: текущая выдача запомнена. Новые объявления пришлю сюда.")
 
     def alert(self, search: avito.Search, fields: dict[str, Any]) -> None:
-        try:
-            self.notifier.send(telegram_notify.message_for(search.profile, search.name, fields))
-        except TelegramError as exc:
-            avito.say("TELEGRAM-ERROR", error=str(exc))
-
-    def add_and_scan(self, url: str) -> None:
-        existing = search_for_link(url)
-        if existing:
-            self.say(f"Этот поиск уже есть (<code>{esc(existing)}</code>), собираю его.")
-            self.scan(existing)
-            return
-        progress = Progress(self, "🔎 Проверяю ссылку на Авито, около минуты…")
-        name, resolved = self.with_job_client(
-            progress, lambda client: avito.add_search(url, log=progress.log, client=client)
-        )
-        lines = [f"✓ Поиск сохранён: <b>{esc(resolved.title)}</b> · {esc(resolved.city)}",
-                 f"Объявлений сейчас: {resolved.total} · имя: <code>{esc(name)}</code>"]
-        if resolved.filters:
-            lines.append("Фильтры: " + esc("; ".join(resolved.filters)))
-        lines += [f"⚠ {esc(warning)}" for warning in resolved.warnings]
-        progress.set_head("\n".join(lines))
-        if resolved.total == 0:
-            self.say("⚠ По этой ссылке сейчас 0 объявлений, собирать нечего. Проверьте ссылку в браузере.")
-            return
-        self.scan(name)
-
-    def scan(self, name: str) -> None:
-        search = avito.load_search(name)
-        progress = Progress(self, f"⏳ Собираю <b>{esc(search.title)}</b>…")
-        path = self.with_job_client(
-            progress, lambda client: avito.scan_search(search, delay=self.delay, log=progress.log, client=client)
-        )
-        self.send_table(search, path, progress)
-
-    def table(self, name: str) -> None:
-        search = avito.load_search(name)
-        progress = Progress(self, f"📊 Собираю таблицу <b>{esc(search.title)}</b>…")
-        path = avito.write_table(search, search.load("seen.json"), log=progress.log)
-        self.send_table(search, path, progress)
-
-    def send_table(self, search: avito.Search, path: Path | None, progress: Progress) -> None:
-        if path is None:
-            progress.set_head(f"В базе «{esc(search.title)}» пока пусто: сначала /scan {esc(search.name)}")
-            return
-        caption = [f"📊 <b>{esc(search.title)}</b>"]
-        caption += [f"{esc(key)}: {esc(value)}" for key, value in progress.table.items()]
-        if progress.error:
-            caption.append(f"⚠ сбор прерван ({esc(progress.error[:200])}); /scan {esc(search.name)} продолжит")
-        progress.set_head(f"✓ Готово: <b>{esc(search.title)}</b>, отправляю таблицу…")
-        self.notifier.send_document(path, caption="\n".join(caption)[:1024])
+        self.send(screens.alert(search.profile, search.name, fields))
 
 
 def run(
