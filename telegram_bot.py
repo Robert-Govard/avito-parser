@@ -48,6 +48,8 @@ COMMANDS = [
     ("watch", "следить за новыми: /watch имя или номер"),
     ("unwatch", "перестать следить: /unwatch имя или номер"),
     ("watching", "за чем слежу"),
+    ("delete", "удалить поиск: /delete имя или номер"),
+    ("clear", "очистить весь список поисков"),
     ("status", "что сейчас делаю"),
     ("stop", "остановить сбор"),
     ("help", "как пользоваться"),
@@ -74,6 +76,7 @@ HELP = (
     "/scan &lt;имя или номер&gt; — собрать поиск (досбор или заново)\n"
     "/table &lt;имя или номер&gt; — таблица из уже собранного, без сбора\n"
     "/watch, /unwatch &lt;имя или номер&gt; — следить за новыми или перестать\n"
+    "/delete &lt;имя или номер&gt; — удалить поиск, /clear — очистить весь список\n"
     "/status — что сейчас делаю\n"
     "/stop — остановить сбор (пришлю таблицу из того, что успел)\n\n"
     "Сбор идёт спокойно, ~30 с на страницу из 50 объявлений, чтобы Авито не блокировал."
@@ -291,9 +294,17 @@ class Bot:
         elif command == "watching":
             text, markup = self.watching_view()
             self.say(text, reply_markup=markup)
+        elif command == "clear":
+            self.confirm_delete(search_names(), origin)
+        elif command == "clearyes":
+            self.delete(search_names(), origin)
+        elif command == "delyes":
+            self.delete([argument] if argument in search_names() else [], origin)
+        elif command == "cancel":
+            self.close(origin, "Отменено, ничего не удалял.")
         elif command == "stop":
             self.stop_jobs()
-        elif command in ("scan", "table", "watch", "unwatch"):
+        elif command in ("scan", "table", "watch", "unwatch", "delete"):
             names = search_names()
             if argument.strip():
                 name = find_search(argument)
@@ -308,6 +319,8 @@ class Bot:
                 self.enqueue(Job(f"сбор «{name}»", lambda: self.scan(name)))
             elif command == "table":
                 self.enqueue(Job(f"таблица «{name}»", lambda: self.table(name)))
+            elif command == "delete":
+                self.confirm_delete([name], origin)
             else:
                 self.set_watch(name, command == "watch")
                 if origin:
@@ -335,8 +348,53 @@ class Bot:
                     {"text": "📊 Таблица", "callback_data": f"table:{name}"},
                     {"text": "🔕 Не следить", "callback_data": f"unwatch:{name}"} if watched
                     else {"text": "👀 Следить", "callback_data": f"watch:{name}"},
+                    {"text": "🗑", "callback_data": f"delete:{name}"},
                 ])
+        keyboard.append([{"text": "🗑 Очистить весь список", "callback_data": "clear:"}])
         return "\n".join(lines), {"inline_keyboard": keyboard}
+
+    def confirm_delete(self, names: list[str], origin: dict[str, Any] | None) -> None:
+        if not names:
+            self.say("Поисков нет, удалять нечего.")
+            return
+        if len(names) == 1:
+            question = f"Удалить поиск «{esc(title_of(names[0]))}» вместе с собранными объявлениями?"
+            yes = f"delyes:{names[0]}"
+        else:
+            question = f"Удалить все поиски ({len(names)}) вместе с собранными объявлениями?"
+            yes = "clearyes:"
+        self.say(question + "\nТаблицы, которые я уже присылал, останутся у вас в чате.",
+                 reply_markup={"inline_keyboard": [[{"text": "🗑 Да, удалить", "callback_data": yes},
+                                                    {"text": "Отмена", "callback_data": "cancel:"}]]})
+
+    def close(self, origin: dict[str, Any] | None, text: str) -> None:
+        """Replace a question with its outcome, so its buttons cannot be pressed twice."""
+        if origin and "message_id" in origin:
+            try:
+                self.notifier.edit(origin["message_id"], text, reply_markup={"inline_keyboard": []})
+                return
+            except TelegramError as exc:
+                avito.say("TELEGRAM-ERROR", error=str(exc))
+        self.say(text)
+
+    def delete(self, names: list[str], origin: dict[str, Any] | None) -> None:
+        if not names:
+            self.close(origin, "Этого поиска уже нет.")
+            return
+        what = f"«{esc(title_of(names[0]))}»" if len(names) == 1 else f"все поиски ({len(names)})"
+        self.close(origin, f"🗑 Удаляю {what}…")
+        # Through the queue: never in the middle of a scan or a watch check of the same search.
+        self.enqueue(Job(f"удаление: {what}", lambda: self.remove(names, what)))
+
+    def remove(self, names: list[str], what: str) -> None:
+        for name in names:
+            with self.watch_lock:
+                self.watching.discard(name)
+            self.announce.discard(name)
+            self.watches.pop(name, None)
+            avito.delete_search(name)
+        self.save_watching()
+        self.say(f"🗑 Удалено: {what}." + ("" if search_names() else " Список поисков пуст — пришлите ссылку на новый."))
 
     def watching_view(self) -> tuple[str, dict[str, Any]]:
         names = sorted(self.watching)

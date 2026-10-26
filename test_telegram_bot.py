@@ -183,3 +183,40 @@ def test_status_and_stop_know_about_watching(bot):
     assert "проверка новых объявлений" in bot.notifier.sent[-1][0] and not bot.stop.is_set()
     bot.handle(message("👀 Слежение"))
     assert bot.notifier.sent[-1][0].startswith("<b>Слежение</b>")
+
+
+def callback(data, message_id=9, text="Мои поиски"):
+    return {"update_id": 5, "callback_query": {"id": "q", "data": data,
+                                               "message": {"chat": {"id": CHAT}, "message_id": message_id, "text": text}}}
+
+
+def test_delete_asks_first_then_removes_the_search_its_data_and_watch(bot):
+    (avito.DATA_DIR / "disks-moskva").mkdir(parents=True)
+    (avito.DATA_DIR / "disks-moskva" / "listings.json").write_text("{}", encoding="utf-8")
+    bot.set_watch("disks-moskva", True)
+    _, markup = bot.list_view()
+    assert markup["inline_keyboard"][0][3] == {"text": "🗑", "callback_data": "delete:disks-moskva"}
+
+    bot.handle(callback("delete:disks-moskva"))
+    question, extra = bot.notifier.sent[-1]
+    assert "Удалить поиск «disks-moskva»" in question and telegram_bot.search_names() == ["disks-moskva", "phones-kazan"]
+    yes = extra["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+
+    bot.handle(callback(yes, message_id=11, text=question))
+    assert bot.notifier.edits[-1] == (11, "🗑 Удаляю «disks-moskva»…")
+    bot.jobs.get_nowait().run()
+    assert telegram_bot.search_names() == ["phones-kazan"]
+    assert not (avito.DATA_DIR / "disks-moskva").exists() and bot.watching == set()
+    assert telegram_bot.load_watching() == set() and "Удалено" in bot.notifier.sent[-1][0]
+
+
+def test_clear_removes_every_search_and_cancel_keeps_them(bot):
+    bot.handle(callback("clear:"))
+    assert "Удалить все поиски (2)" in bot.notifier.sent[-1][0]
+    bot.handle(callback("cancel:", message_id=12))
+    assert bot.notifier.edits[-1] == (12, "Отменено, ничего не удалял.") and len(telegram_bot.search_names()) == 2
+
+    bot.handle(message("/clear"))
+    bot.handle(callback("clearyes:", message_id=13))
+    bot.jobs.get_nowait().run()
+    assert telegram_bot.search_names() == [] and "Список поисков пуст" in bot.notifier.sent[-1][0]

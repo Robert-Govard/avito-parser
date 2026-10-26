@@ -209,6 +209,14 @@ class ScanStopped(Exception):
     """Raised from a ``log`` callback to stop a scan between requests."""
 
 
+def delete_search(name: str) -> None:
+    """Remove a saved search together with its collected listings (tables in output/ stay)."""
+    import shutil
+
+    (SEARCHES_DIR / f"{name}.json").unlink(missing_ok=True)
+    shutil.rmtree(DATA_DIR / name, ignore_errors=True)
+
+
 def write_table(search: Search, seen_before: dict[str, str], *, log: Any = None) -> Path | None:
     base = search.load("listings.json")
     if not base:
