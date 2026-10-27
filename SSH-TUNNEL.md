@@ -323,6 +323,45 @@ systemctl is-active avito-bot
 
 ---
 
+## 8а. Добавить ещё сервер (третий, четвёртый…)
+
+Каждый сервер — ещё один адрес со своим лимитом Авито: проверки слежения идут по очереди
+со всех адресов, так что каждый новый сервер сокращает задержку уведомлений. Сбор идёт через
+первый работающий туннель; если он откажет — через следующий.
+
+1. **На Mac** — тот же ключ на новый сервер (шаг 3.2), например:
+   ```bash
+   ssh root@НОВЫЙ_СЕРВЕР 'echo "restrict,port-forwarding,command=\"/bin/false\" ОТКРЫТЫЙ_КЛЮЧ" >> ~/.ssh/authorized_keys'
+   ```
+2. **На сервере бота** — туннель на свободном порту (1081, 1082, …) по шаблону:
+   ```bash
+   cat > /etc/systemd/system/avito-tunnel@.service <<'EOF'
+   [Unit]
+   Description=SOCKS tunnel %i for avito-bot (127.0.0.1:%i -> another server)
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   EnvironmentFile=/etc/default/avito-tunnel-%i
+   ExecStart=/usr/bin/ssh -N -D 127.0.0.1:%i -i /root/.ssh/avito_tunnel -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new root@${TUNNEL_HOST}
+   Restart=always
+   RestartSec=20
+
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   echo "TUNNEL_HOST=НОВЫЙ_СЕРВЕР" > /etc/default/avito-tunnel-1081
+   systemctl daemon-reload && systemctl enable --now avito-tunnel@1081
+   curl -s --socks5-hostname 127.0.0.1:1081 https://ifconfig.me; echo   # адрес нового сервера
+   ```
+   Шаблон создаётся один раз; для следующего сервера — только файл `/etc/default/avito-tunnel-1082`
+   и `systemctl enable --now avito-tunnel@1082`.
+3. **В службе бота** допишите ещё один `--scan-proxy socks5h://127.0.0.1:1081` (раздел 6),
+   `systemctl daemon-reload` и перезапуск, когда бот ничего не собирает. Прокси, туннель которого
+   не отвечает, бот просто не использует — их можно прописать заранее.
+
+---
+
 ## 9. Если что-то не работает
 
 Журнал туннеля:

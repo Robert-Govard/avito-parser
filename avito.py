@@ -799,8 +799,9 @@ def main_cli(argv: list[str] | None = None) -> None:
     bot.add_argument("--delay", type=float, default=avito_client.DEFAULT_DELAY_SECONDS)
     bot.add_argument("--watch-interval", type=float, default=45,
                      help="секунд между проверками новых объявлений с одного адреса (~80 запросов в час при 45)")
-    bot.add_argument("--scan-proxy", help="прокси для сборов, напр. socks5h://127.0.0.1:1080 (SSH-туннель на другой сервер), "
-                                         "чтобы сбор не делил лимит запросов со слежением")
+    bot.add_argument("--scan-proxy", action="append",
+                     help="прокси на другой сервер, напр. socks5h://127.0.0.1:1080 (SSH-туннель); можно несколько раз — "
+                          "у каждого адреса свой лимит Авито, слежение идёт по очереди со всех, сбор через первый")
     bot.set_defaults(func=cmd_bot)
 
     args = parser.parse_args(argv)

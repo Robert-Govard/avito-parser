@@ -9,6 +9,7 @@ import tg_screens
 import tg_ui
 
 CHAT = 42
+PROXY, PROXY2 = "socks5h://127.0.0.1:1080", "socks5h://127.0.0.1:1081"
 
 
 class FakeNotifier:
@@ -233,15 +234,15 @@ def test_clear_removes_every_search(bot):
 
 def test_jobs_go_through_the_proxy_with_its_own_pace(bot, monkeypatch):
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
-    bot.scan_proxy = "socks5h://127.0.0.1:1080"
-    client, via_proxy = bot.job_client()
-    assert via_proxy and client.proxy == bot.scan_proxy and client.pacer is bot.proxy_pacer
+    bot.use_proxies([PROXY])
+    client, address = bot.job_client()
+    assert address == PROXY and client.proxy == PROXY and client.pacer is bot.pacers[PROXY]
     assert "через второй сервер" in bot.menu_screen().text
 
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: False)
     bot._job_clients.clear()
-    client, via_proxy = bot.job_client()
-    assert not via_proxy and client.pacer is bot.pacer  # the same address: the same pace as the checks
+    client, address = bot.job_client()
+    assert address == telegram_bot.DIRECT and client.pacer is bot.pacer  # the same address: the same pace as the checks
     assert "Второй сервер для сбора недоступен" in bot.notifier.last
     assert "Второй сервер недоступен" in bot.menu_screen().text
 
@@ -273,7 +274,7 @@ def watched(bot, monkeypatch):
 
     monkeypatch.setattr(avito, "Watch", FakeWatch)
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
-    bot.scan_proxy = "socks5h://127.0.0.1:1080"
+    bot.use_proxies([PROXY])
     bot.watch_interval = 0
     for name in telegram_bot.search_names():
         bot.set_watch(name, True)
@@ -281,7 +282,7 @@ def watched(bot, monkeypatch):
 
 def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
-    bot.scan_proxy = "socks5h://127.0.0.1:1080"
+    bot.use_proxies([PROXY])
     table = tmp_path / "t.xlsx"
     table.write_bytes(b"xlsx")
     calls = []
@@ -299,7 +300,7 @@ def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatc
 
     monkeypatch.setattr(avito, "scan_search", fake_scan)
     bot.scan("disks-moskva")
-    assert calls == [bot.scan_proxy, None]
+    assert calls == [PROXY, None]
     assert any("Второй сервер для сбора недоступен" in screen.text for screen in bot.notifier.sent)
     path, caption = bot.notifier.documents[0]
     assert path == table and "прерван" not in bot.notifier.edits[-1][1].text
@@ -383,10 +384,10 @@ def test_watch_checks_take_turns_between_the_two_addresses(bot, watched):
         bot.watch_step()
     assert [via for _, via in checks] == ["direct", "proxy", "direct", "proxy"]
     assert sorted(name for name, _ in checks) == ["cars-moskva", "disks-moskva", "flats-moskva", "phones-kazan"]
-    assert bot.watch_client(True).pacer is bot.proxy_pacer and bot.watch_client(False).pacer is bot.pacer
+    assert bot.watch_client(PROXY).pacer is bot.pacers[PROXY] and bot.watch_client("").pacer is bot.pacer
 
     checks.clear()
-    bot.proxy_off_until = telegram_bot.time.monotonic() + 60  # the second server is out
+    bot.rested_until[PROXY] = telegram_bot.time.monotonic() + 60  # the second server is out
     for _ in range(4):
         bot.watch_step()
     assert [via for _, via in checks] == ["direct"] * 4
@@ -408,7 +409,7 @@ def test_a_turned_away_address_rests_and_the_other_carries_on(bot, watched):
         bot.watch_step()
     # the first check is turned away; the rest go through the second server instead of waiting 10 minutes
     assert checks[0][1] == "direct" and [via for _, via in checks[1:]] == ["proxy", "proxy", "proxy"]
-    assert bot.rested_until[False] > telegram_bot.time.monotonic() + 500
+    assert bot.rested_until[""] > telegram_bot.time.monotonic() + 500
     assert bot.watches[checks[0][0]].reloads == 1  # what the cut check saw is not taken as seen
 
 
@@ -430,3 +431,18 @@ def test_alert_goes_out_at_once_then_shows_what_the_page_told(bot):
     assert "3 (+3 сегодня)" in bot.notifier.edits[-1][1].text and "Переопубликовано" not in bot.notifier.edits[-1][1].text
     update({**fields, "views": "8526 (+109 сегодня)"}, False)
     assert "Переопубликовано" in bot.notifier.edits[-1][1].text
+
+
+def test_three_addresses_share_the_checks_and_a_job_moves_to_the_next_proxy(bot, watched, monkeypatch):
+    checks, turned_away = watched
+    bot.use_proxies([PROXY, PROXY2])
+    for _ in range(3):
+        bot.watch_step()
+    assert {client.proxy for client in bot.watch_clients.values()} == {None, PROXY, PROXY2}
+    assert bot.live_addresses() == 3
+
+    monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: proxy != PROXY)  # the first tunnel is down
+    client, address = bot.job_client()
+    assert address == PROXY2 and client.pacer is bot.pacers[PROXY2]
+    assert "Второй сервер для сбора недоступен" in bot.notifier.last and "через другой сервер" in bot.notifier.last
+    assert bot.label(PROXY2) == "третий сервер"
