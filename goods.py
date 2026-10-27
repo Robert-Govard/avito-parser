@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,14 @@ CHEAP_SHARE = 0.85
 MIN_GROUP_SIZE = 3
 # A "private" seller with this many closed listings is a shop or a reseller.
 SHOP_CLOSED_LISTINGS = 100
+# A reseller network posing as private people: fresh accounts that list the
+# same model at one exact, non-round price again and again ("34 990"), or
+# "sealed, with warranty" phones long out of production. Measured on Moscow
+# iPhones in October 2026: 60-75% of "private" listings, raising the median
+# by up to 10%. Private people repeat round prices (25 000) — those stay.
+NETWORK_REPEATS = 4
+NETWORK_WORDS = re.compile(r"запечатан[^.!\n]{0,80}гаранти|гаранти[^.!\n]{0,80}запечатан", re.IGNORECASE)
+NETWORK = "сеть перекупов (одинаковые цены)"
 
 # Locked or broken devices are sold far below market; they are marked and
 # left out of the market price.
@@ -45,6 +54,7 @@ class Offer:
     avito_price_badge: str
     city: str = ""
     defect: bool = False
+    network: bool = False
     market: int | None = None
     vs_market: float | None = None
     notes: list[str] = field(default_factory=list)
@@ -88,10 +98,34 @@ class GroupStats:
     high: int
 
 
+def network_prices(offers: list[Offer]) -> Counter:
+    """How many listings of each (group, price) private sellers without a shop history put up."""
+    return Counter(
+        (offer.group, offer.listing.price) for offer in offers
+        if offer.listing.price and offer.seller == "частное лицо"
+        and (offer.listing.closed_listings or 0) < SHOP_CLOSED_LISTINGS
+    )
+
+
+def is_network(offer: Offer, prices: Counter) -> bool:
+    price = offer.listing.price
+    if price and price % 1000 and prices[(offer.group, price)] >= NETWORK_REPEATS:
+        return True
+    return bool(NETWORK_WORDS.search(f"{offer.listing.title} {offer.listing.description}"))
+
+
+def mark_networks(offers: list[Offer]) -> Counter:
+    prices = network_prices(offers)
+    for offer in offers:
+        offer.network = is_network(offer, prices)
+    return prices
+
+
 def market_stats(offers: list[Offer]) -> dict[str, GroupStats]:
+    """Market prices by group, leaving out broken devices and the reseller network (mark_networks)."""
     groups: dict[str, list[int]] = {}
     for offer in offers:
-        if offer.listing.price and not offer.defect:
+        if offer.listing.price and not offer.defect and not offer.network:
             groups.setdefault(offer.group, []).append(offer.listing.price)
     result = {}
     for group, prices in groups.items():
@@ -173,6 +207,8 @@ LISTING_COLUMNS = (
 
 
 def seller_kind(offer: Offer) -> str:
+    if offer.network:
+        return NETWORK
     if offer.seller != "частное лицо":
         return offer.seller
     if (offer.listing.closed_listings or 0) >= SHOP_CLOSED_LISTINGS:
@@ -276,7 +312,9 @@ def write_summary(
     put("Всего объявлений", len(offers), bold=True)
     put("   от частных лиц", kinds.count("частное лицо"))
     put("   от частных лиц, похожих на перекупщиков", kinds.count(RESELLER))
-    put("   от магазинов и компаний", len(kinds) - kinds.count("частное лицо") - kinds.count(RESELLER))
+    put("   сеть перекупов с одинаковыми ценами", kinds.count(NETWORK))
+    put("   от магазинов и компаний",
+        len(kinds) - kinds.count("частное лицо") - kinds.count(RESELLER) - kinds.count(NETWORK))
     if home_city:
         put("   из других городов (с доставкой)", sum(is_other_city(offer, home_city) for offer in offers))
     put("   неисправные или на запчасти (по описанию)", sum(offer.defect for offer in offers))
@@ -340,6 +378,8 @@ def write_summary(
         "Рыночная цена — медиана похожих объявлений (та же модель), см. лист «Рыночные цены».",
         "Красная строка — по описанию неисправен или на запчасти; жёлтая — подозрительно дёшево.",
         f"«Похоже на перекупа» — частное лицо с {SHOP_CLOSED_LISTINGS}+ завершёнными объявлениями.",
+        "«Сеть перекупов» — аккаунты без истории с одной и той же некруглой ценой (34 990) "
+        "или «запечатанный, с гарантией»; в рыночную цену не входят.",
     ):
         put("   " + line)
     if not stats:

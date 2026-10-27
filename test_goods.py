@@ -151,3 +151,19 @@ def test_table_is_sorted_by_price_with_readable_columns(tmp_path):
     cheapest = next(i for i, r in enumerate(summary) if r[0] and str(r[0]).startswith("Самые дешёвые"))
     first = next(r for r in summary[cheapest + 1:] if isinstance(r[0], int))
     assert first[0] == 35_000  # private, not broken, not the reseller
+
+
+def test_reseller_network_is_left_out_of_the_market_price():
+    base = {str(i): phone(i, price) for i, price in enumerate((30_000, 31_000, 32_000, 33_000))}
+    for i in range(10, 15):  # one non-round price over and over from fresh accounts
+        base[str(i)] = phone(i, 38_990, closed="0 завершённых объявлений",
+                             description="Новый, запечатанный, оригинальный, с гарантией!")
+    base["20"] = phone(20, 25_000, description="Запечатанный, в подарок достался")  # no warranty talk: a person
+    profile = profiles.GoodsProfile(base, "sankt-peterburg")
+    group = "iPhone 15, 128 ГБ"
+    assert profile.stats[group].median == 31_000  # 38 990 ×5 would have pulled it up
+    assert profile.alert(phone(30, 38_990, closed="0 завершённых объявлений")) is None
+    assert profile.alert(phone(31, 29_000)) is not None
+    offers = [goods.offer_from_item(item) for item in base.values()]
+    goods.mark_networks(offers)
+    assert goods.seller_kind(offers[-2]) == goods.NETWORK and goods.seller_kind(offers[-1]) == "частное лицо"

@@ -189,33 +189,6 @@ def test_watch_from_the_card_redraws_it_and_survives_restart(bot):
     assert telegram_bot.Bot(FakeNotifier(), delay=0).watching == set()
 
 
-def test_watch_cycle_primes_then_alerts_and_waits_for_the_interval(bot, monkeypatch):
-    checks = []
-
-    class FakeWatch:
-        def __init__(self, search):
-            self.search, self.primed, self.profile = search, False, None
-
-        def check(self, client, *, on_alert, log=None):
-            checks.append(self.search.name)
-            if self.primed:
-                on_alert({"title": "iPhone", "price": "1 ₽", "seller": "частное лицо", "url": "https://www.avito.ru/x_1"})
-            self.primed = True
-
-        def reload(self):
-            pass
-
-    monkeypatch.setattr(avito, "Watch", FakeWatch)
-    monkeypatch.setattr(telegram_bot.avito_client, "CalmClient", lambda **kwargs: object())
-    bot.set_watch("phones-kazan", True)
-    bot.watch_cycle()
-    assert checks == ["phones-kazan"] and "текущая выдача запомнена" in bot.notifier.last
-    assert bot.watch_due > telegram_bot.time.monotonic()
-    bot.watch_cycle()
-    alert = bot.notifier.sent[-1]
-    assert "iPhone" in alert.text and alert.rows[0][0].to_api()["url"] == "https://www.avito.ru/x_1"
-
-
 def test_stop_does_not_touch_watching(bot):
     bot.set_watch("disks-moskva", True)
     bot.handle(message("/stop"))
@@ -284,9 +257,12 @@ def watched(bot, monkeypatch):
 
     class FakeWatch:
         def __init__(self, search):
-            self.search, self.primed, self.profile, self.reloads = search, True, None, 0
+            self.search, self.primed, self.profile, self.model, self.seen, self.reloads = search, True, None, None, {}, 0
 
-        def check(self, client, *, on_alert, log=None):
+        def merge_keys(self):
+            return []
+
+        def check(self, client, *, on_alert, log=None, instant=False):
             via = "proxy" if client.proxy else "direct"
             checks.append((self.search.name, via))
             if via in turned_away:
@@ -298,41 +274,10 @@ def watched(bot, monkeypatch):
     monkeypatch.setattr(avito, "Watch", FakeWatch)
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
     bot.scan_proxy = "socks5h://127.0.0.1:1080"
+    bot.watch_interval = 0
     for name in telegram_bot.search_names():
         bot.set_watch(name, True)
     return checks, turned_away
-
-
-def test_watch_checks_take_turns_between_the_two_addresses(bot, watched):
-    checks, _ = watched
-    bot.watch_cycle()
-    assert [via for _, via in checks] == ["direct", "proxy", "direct", "proxy"]
-    assert bot.watch_client(True).pacer is bot.proxy_pacer and bot.watch_client(False).pacer is bot.pacer
-    assert bot.check_minutes == 1  # four searches over two addresses: two checks each per cycle
-
-    checks.clear()
-    bot.proxy_off_until = telegram_bot.time.monotonic() + 60  # the second server is out
-    bot.watch_cycle()
-    assert [via for _, via in checks] == ["direct"] * 4
-
-
-def test_a_turned_away_address_rests_and_the_other_carries_on(bot, watched):
-    checks, turned_away = watched
-    turned_away.add("direct")
-    bot.watch_cycle()
-    # the first check is turned away; the rest go through the second server instead of waiting 10 minutes
-    assert checks == [("cars-moskva", "direct"), ("disks-moskva", "proxy"), ("flats-moskva", "proxy"),
-                      ("phones-kazan", "proxy")]
-    assert bot.rested_until[False] > telegram_bot.time.monotonic() + 500
-    assert bot.watches["cars-moskva"].reloads == 1  # what the cut check saw is not taken as seen
-
-
-def test_with_both_addresses_turned_away_the_watch_waits_for_the_first_to_rest(bot, watched):
-    checks, turned_away = watched
-    turned_away.update({"direct", "proxy"})
-    bot.watch_cycle()
-    assert len(checks) == 2 and bot.watch_due == min(bot.rested_until.values())
-
 
 def test_scan_goes_on_from_this_server_when_the_proxy_is_blocked(bot, monkeypatch, tmp_path):
     monkeypatch.setattr(telegram_bot, "proxy_reachable", lambda proxy: True)
@@ -430,3 +375,58 @@ def test_a_flat_alert_carries_the_draft_and_the_link():
     })
     assert "12 000 000 ₽" in screen.text and "Черновик" in screen.text and "&lt;тест&gt;" in screen.html
     assert screen.rows[0][0].url == "https://www.avito.ru/y_2" and "#flats_spb" in screen.text
+
+
+def test_watch_checks_take_turns_between_the_two_addresses(bot, watched):
+    checks, _ = watched
+    for _ in range(4):
+        bot.watch_step()
+    assert [via for _, via in checks] == ["direct", "proxy", "direct", "proxy"]
+    assert sorted(name for name, _ in checks) == ["cars-moskva", "disks-moskva", "flats-moskva", "phones-kazan"]
+    assert bot.watch_client(True).pacer is bot.proxy_pacer and bot.watch_client(False).pacer is bot.pacer
+
+    checks.clear()
+    bot.proxy_off_until = telegram_bot.time.monotonic() + 60  # the second server is out
+    for _ in range(4):
+        bot.watch_step()
+    assert [via for _, via in checks] == ["direct"] * 4
+
+
+def test_each_address_keeps_its_own_spacing(bot, watched):
+    checks, _ = watched
+    bot.watch_interval = 3600
+    assert bot.watch_step() and bot.watch_step()  # one check from each address
+    before = len(checks)
+    bot.watch_step()  # both just used: it waits instead of checking
+    assert len(checks) == before == 2
+
+
+def test_a_turned_away_address_rests_and_the_other_carries_on(bot, watched):
+    checks, turned_away = watched
+    turned_away.add("direct")
+    for _ in range(4):
+        bot.watch_step()
+    # the first check is turned away; the rest go through the second server instead of waiting 10 minutes
+    assert checks[0][1] == "direct" and [via for _, via in checks[1:]] == ["proxy", "proxy", "proxy"]
+    assert bot.rested_until[False] > telegram_bot.time.monotonic() + 500
+    assert bot.watches[checks[0][0]].reloads == 1  # what the cut check saw is not taken as seen
+
+
+def test_with_both_addresses_turned_away_the_watch_waits(bot, watched):
+    checks, turned_away = watched
+    turned_away.update({"direct", "proxy"})
+    for _ in range(4):
+        bot.watch_step()
+    assert len(checks) == 2 and bot.watch_addresses() == []
+
+
+def test_alert_goes_out_at_once_then_shows_what_the_page_told(bot):
+    search = avito.load_search("disks-moskva")
+    fields = {"title": "iPhone 15", "price": "30 000 ₽", "seller": "частное лицо", "url": "https://www.avito.ru/x_1"}
+    update = bot.alert(search, fields)
+    first = bot.notifier.sent[-1]
+    assert "проверяю, новое ли" in first.text and first.rows[0][0].url == "https://www.avito.ru/x_1"
+    update({**fields, "views": "3 (+3 сегодня)"}, True)
+    assert "3 (+3 сегодня)" in bot.notifier.edits[-1][1].text and "Переопубликовано" not in bot.notifier.edits[-1][1].text
+    update({**fields, "views": "8526 (+109 сегодня)"}, False)
+    assert "Переопубликовано" in bot.notifier.edits[-1][1].text

@@ -11,8 +11,11 @@ button; the finished table arrives as an .xlsx document.
 
 Jobs (add a link, collect, build a table) run one at a time in a thread, so
 the bot keeps answering while a scan walks Avito at its calm pace. Watched
-searches are checked about once a minute in a thread of their own: the first
-page of each, new listings sent to the chat. The watch list survives restarts.
+searches are checked back to back in a thread of their own: the newest
+listings of each, new ones sent to the chat at once (the check of a listing's
+page for re-publishing follows and edits the alert). Searches that differ only
+in the model are read with one request (avito.WatchGroup). The watch list
+survives restarts.
 
 Avito limits requests per IP address, so the load is spread over two:
 this server's and, through ``--scan-proxy`` (an SSH tunnel, SSH-TUNNEL.md),
@@ -29,7 +32,6 @@ from __future__ import annotations
 import json
 import math
 import queue
-import random
 import re
 import socket
 import threading
@@ -51,8 +53,12 @@ from tg_ui import RUNNING, STATS, STOP, Screen, ce, esc, plural
 POLL_SECONDS = 50
 NETWORK_PAUSE_SECONDS = 10
 CONFLICT_PAUSE_SECONDS = 30
-WATCH_INTERVAL_SECONDS = 60
+# Seconds between watch requests from one address: ~80 an hour. Avito began
+# turning an address away after hours at ~120 an hour (October 2026).
+WATCH_INTERVAL_SECONDS = 45
 WATCH_FAILURES_TO_REPORT = 3
+MARKET_REFRESH_SECONDS = 30 * 60
+PROXY_CHECK_SECONDS = 30
 PROXY_RETRY_SECONDS = 30 * 60
 AVITO_LINK = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+")
 # Client events worth showing under a job's progress.
@@ -227,10 +233,9 @@ class Bot:
         self.current: Job | None = None
         self.stop = threading.Event()
         self.panel_id: int | None = None  # the "live" menu message
-        self.watch_interval = watch_interval
+        self.watch_interval = watch_interval  # between watch requests from one address
         self.watching = load_watching()  # names; changed by the Telegram side, read by the watch thread
         self.watch_lock = threading.Lock()
-        self.watch_due = 0.0  # time.monotonic() of the next watch cycle
         self.announce: set[str] = set()  # newly watched: tell when the current listings are remembered
         self.reload_watches = threading.Event()  # a job stored listings the watches have not seen
         # One pace per address: this server's, and the second server's behind the proxy.
@@ -245,7 +250,11 @@ class Bot:
         self.watches: dict[str, avito.Watch] = {}
         self.failures: dict[str, int] = {}
         self.watch_clients: dict[bool, avito_client.CalmClient] = {}
-        self.cycles = 0
+        self.units: list[avito.WatchGroup] = []  # read by the Telegram side for the period shown
+        self.turn = 0
+        self.last_watch = {False: 0.0, True: 0.0}
+        self.market_refreshed = time.monotonic()
+        self._proxy_seen = (0.0, False)  # when the tunnel was last tried, and whether it answered
 
     # --- sending ---------------------------------------------------------
 
@@ -277,11 +286,11 @@ class Bot:
     # --- views -------------------------------------------------------------
 
     @property
-    def check_minutes(self) -> int:
-        """How often each watched search is looked at: the interval, or longer with many searches."""
+    def check_period(self) -> float:
+        """Seconds between two looks at the same watched search."""
+        reads = len(self.units) or len(self.watching) or 1
         addresses = 2 if self.proxy_usable() else 1
-        cycle = max(self.watch_interval, math.ceil(len(self.watching) / addresses) * self.delay)
-        return max(1, round(cycle / 60))
+        return reads * self.watch_interval / addresses
 
     def info(self, name: str) -> screens.SearchInfo:
         search = avito.load_search(name)
@@ -305,12 +314,12 @@ class Bot:
         items = self.infos()
         return screens.menu(screens.MenuView(
             searches=len(items), listings=sum(s.stored for s in items), watching=len(self.watching),
-            check_minutes=self.check_minutes, new_today=sum(s.new_today for s in items),
+            check_seconds=self.check_period, new_today=sum(s.new_today for s in items),
             job=self.current.title if self.current else None, queued=self.jobs.qsize(), route=self.route(),
         ))
 
     def watching_screen(self) -> Screen:
-        return screens.watching([s for s in self.infos() if s.watched], self.check_minutes)
+        return screens.watching([s for s in self.infos() if s.watched], self.check_period)
 
     # --- Telegram side -----------------------------------------------------
 
@@ -399,7 +408,7 @@ class Bot:
         elif command == "new":
             self.show(screens.new_search(), origin)
         elif command == "help":
-            self.show(screens.help_screen(self.check_minutes), origin)
+            self.show(screens.help_screen(self.check_period), origin)
         elif command == "stop":
             self.stop_jobs(origin)
         elif command == "clear":
@@ -476,7 +485,6 @@ class Bot:
             self.announce.add(name)
             with self.watch_lock:
                 self.watching.add(name)
-            self.watch_due = 0.0
             text = f"👀 Слежу за «{title}». Сначала запомню то, что уже выставлено, дальше пришлю сюда новые."
         elif on:
             text = f"Уже слежу за «{title}»."
@@ -636,21 +644,72 @@ class Bot:
 
     def watch_loop(self) -> None:
         while True:
-            if self.watching and time.monotonic() >= self.watch_due:
+            try:
+                if not self.watch_step():
+                    time.sleep(1)
+            except Exception:  # a bug in one check must not stop the thread
+                traceback.print_exc()
+                time.sleep(self.watch_interval)
+
+    def watch_step(self) -> bool:
+        """Check the next search (or group) from the address rested longest; False if there is nothing to do."""
+        if not self.watching:
+            return False
+        self.sync_watches()
+        addresses = self.watch_addresses()
+        if not self.units or not addresses:
+            return False
+        via_proxy = min(addresses, key=lambda address: self.last_watch[address])
+        wait = self.last_watch[via_proxy] + self.watch_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, 1))  # short naps: a newly watched search is not kept waiting
+            return True
+        fresh = [unit for unit in self.units if not all(watch.primed for watch in unit.watches)]
+        if fresh:  # just switched on: remember what is listed now, first
+            unit = fresh[0]
+        else:
+            unit = self.units[self.turn % len(self.units)]
+            self.turn += 1
+        self.last_watch[via_proxy] = time.monotonic()
+        self.check_unit(unit, via_proxy)
+        return True
+
+    def sync_watches(self) -> None:
+        """Watches for the watched searches, re-read after a scan, grouped into requests."""
+        with self.watch_lock:
+            names = sorted(self.watching)
+        for name in set(self.watches) - set(names):
+            del self.watches[name]
+        for name in names:
+            if name not in self.watches:
                 try:
-                    self.watch_cycle()
-                except Exception:  # a bug in one cycle must not stop the thread
-                    traceback.print_exc()
-                    self.watch_due = time.monotonic() + self.watch_interval
-            else:
-                time.sleep(1)
+                    self.watches[name] = avito.Watch(avito.load_search(name))
+                except SystemExit:  # the search was deleted
+                    with self.watch_lock:
+                        self.watching.discard(name)
+                    self.save_watching()
+        if self.reload_watches.is_set():
+            self.reload_watches.clear()
+            for watch in self.watches.values():
+                watch.reload()
+        if time.monotonic() - self.market_refreshed > MARKET_REFRESH_SECONDS:
+            self.market_refreshed = time.monotonic()
+            for watch in self.watches.values():
+                if hasattr(watch.profile, "refresh_market"):
+                    watch.profile.refresh_market()
+        self.units = avito.watch_groups([self.watches[name] for name in names if name in self.watches])
 
     def watch_addresses(self) -> list[bool]:
         """The addresses checks may use now (True: the second server's), turned-away ones resting."""
         now = time.monotonic()
         addresses = [] if now < self.rested_until[False] else [False]
-        if self.proxy_usable() and now >= self.rested_until[True] and proxy_reachable(self.scan_proxy):
-            addresses.append(True)
+        if self.proxy_usable() and now >= self.rested_until[True]:
+            tried, answered = self._proxy_seen
+            if now - tried > PROXY_CHECK_SECONDS:
+                answered = proxy_reachable(self.scan_proxy)
+                self._proxy_seen = (now, answered)
+            if answered:
+                addresses.append(True)
         return addresses
 
     def watch_client(self, via_proxy: bool) -> avito_client.CalmClient:
@@ -667,65 +726,46 @@ class Bot:
         if kind in ("IP-BLOCK", "NETWORK-WAIT"):
             raise AddressRested(kind)  # not the client's 10-minute wait: the other address goes on
 
-    def watch_cycle(self) -> None:
-        """Check every watched search once, taking turns between the addresses."""
-        if self.reload_watches.is_set():
-            self.reload_watches.clear()
-            for watch in self.watches.values():
-                watch.reload()
-        started = time.monotonic()
-        self.cycles += 1
-        with self.watch_lock:
-            names = sorted(self.watching)
-        for name in set(self.watches) - set(names):
-            del self.watches[name]
-        turn = 0
-        for name in names:
-            if name not in self.watching:  # unwatched or deleted meanwhile
-                continue
-            addresses = self.watch_addresses()
-            if not addresses:  # both turned away: wait for the first to rest
-                self.watch_due = min(self.rested_until.values())
-                return
-            self.check_one(name, addresses[turn % len(addresses)])
-            turn += 1
-        # Counted from the start: with many searches the checks simply run back to back.
-        self.watch_due = started + self.watch_interval * random.uniform(0.9, 1.1)
-
-    def check_one(self, name: str, via_proxy: bool = False) -> None:
-        watch = self.watches.get(name)
-        if watch is None:
-            try:
-                watch = self.watches[name] = avito.Watch(avito.load_search(name))
-            except SystemExit:  # the search was deleted
-                with self.watch_lock:
-                    self.watching.discard(name)
-                self.save_watching()
-                return
-        elif self.cycles % avito.MARKET_REFRESH_EVERY_CYCLES == 0 and hasattr(watch.profile, "refresh_market"):
-            watch.profile.refresh_market()
-        search = watch.search
+    def check_unit(self, unit: avito.WatchGroup, via_proxy: bool) -> None:
         try:
-            watch.check(self.watch_client(via_proxy), on_alert=lambda fields: self.alert(search, fields))
-            self.failures[name] = 0
+            unit.check(self.watch_client(via_proxy), on_alert=self.alert, instant=True)
+            for name in unit.names:
+                self.failures[name] = 0
         except AddressRested:
             self.rested_until[via_proxy] = time.monotonic() + avito_client.IP_BLOCK_WAIT_SECONDS
             avito.say("BOT", text=f"{'второй сервер' if via_proxy else 'этот сервер'}: Авито не пускает, "
                                   f"отдыхает {avito_client.IP_BLOCK_WAIT_SECONDS // 60} мин, проверки идут через другой")
-            watch.reload()  # forget what this half-done check marked as seen: the next check alerts on it
+            for watch in unit.watches:
+                watch.reload()  # forget what the cut check marked as seen: the next check alerts on it
         except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
             error = f"{type(exc).__name__}: {exc}"[:300]
-            avito.say("ERROR", search=name, error=error)
-            watch.reload()
-            self.failures[name] = self.failures.get(name, 0) + 1
-            if self.failures[name] == WATCH_FAILURES_TO_REPORT:
-                self.say(f"⚠️ Не получается проверить «{esc(search.title)}» ({esc(error)}). Продолжаю пробовать.")
-        if name in self.announce and watch.primed:
-            self.announce.discard(name)
-            self.say(f"✅ «{esc(search.title)}»: текущая выдача запомнена. Новые объявления пришлю сюда.")
+            avito.say("ERROR", search=", ".join(unit.names), error=error)
+            for watch in unit.watches:
+                watch.reload()
+                name = watch.search.name
+                self.failures[name] = self.failures.get(name, 0) + 1
+                if self.failures[name] == WATCH_FAILURES_TO_REPORT:
+                    self.say(f"⚠️ Не получается проверить «{esc(watch.search.title)}» ({esc(error)}). Продолжаю пробовать.")
+        for watch in unit.watches:
+            if watch.search.name in self.announce and watch.primed:
+                self.announce.discard(watch.search.name)
+                self.say(f"✅ «{esc(watch.search.title)}»: текущая выдача запомнена. Новые объявления пришлю сюда.")
 
-    def alert(self, search: avito.Search, fields: dict[str, Any]) -> None:
-        self.send(screens.alert(search.profile, search.name, fields))
+    def alert(self, search: avito.Search, fields: dict[str, Any]) -> Callable[[dict[str, Any], bool | None], None] | None:
+        """Send a new listing at once; the returned function adds what its page tells, once it is read."""
+        checking = search.new_only
+        message_id = self.send(screens.alert(search.profile, search.name, fields, state="checking" if checking else None))
+        if message_id is None or not checking:
+            return None
+
+        def update(fields: dict[str, Any], verdict: bool | None) -> None:
+            screen = screens.alert(search.profile, search.name, fields, state="republished" if verdict is False else None)
+            try:
+                self.notifier.edit_screen(message_id, screen)
+            except TelegramError as exc:
+                avito.say("TELEGRAM-ERROR", error=str(exc))
+
+        return update
 
 
 def run(

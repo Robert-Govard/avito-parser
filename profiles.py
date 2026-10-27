@@ -119,10 +119,15 @@ class GoodsProfile:
         self.refresh_market()
 
     def refresh_market(self) -> None:
-        self.stats = goods.market_stats([goods.offer_from_item(item) for item in self.base.values()])
+        offers = [goods.offer_from_item(item) for item in self.base.values()]
+        self.network_prices = goods.mark_networks(offers)
+        self.stats = goods.market_stats(offers)
 
     def alert(self, item: dict[str, Any]) -> dict[str, Any] | None:
         offer = goods.offer_from_item(item)
+        # The reseller network floods the feed with the same "new, sealed" phones.
+        if goods.is_network(offer, self.network_prices):
+            return None
         # Listings from other cities come with delivery and flood the feed;
         # they stay in the table but do not alert.
         if self.home_city and offer.city and offer.city != self.home_city:
@@ -141,6 +146,7 @@ class GoodsProfile:
         self, path: Path, seen_before: dict[str, str], *, title: str = "", link: str = ""
     ) -> dict[str, int]:
         offers = [goods.offer_from_item(item) for item in self.base.values()]
+        goods.mark_networks(offers)
         stats = goods.market_stats(offers)
         goods.annotate(offers, stats, self.home_city)
         for offer in offers:

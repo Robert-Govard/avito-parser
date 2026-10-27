@@ -31,6 +31,13 @@ def _count(n: int, one: str, few: str, many: str) -> str:
     return f"{n:,}".replace(",", " ") + " " + plural(n, one, few, many)
 
 
+def every(seconds: float) -> str:
+    """«~45 с», «~2 мин»: how often something happens."""
+    if seconds < 90:
+        return f"~{max(5, round(seconds / 5) * 5)} с"
+    return f"~{round(seconds / 60)} мин"
+
+
 def notice(text: str) -> str:
     """A line on top of a screen saying what the last button did (``text`` is HTML)."""
     return f"<blockquote>{text}</blockquote>"
@@ -43,7 +50,7 @@ class MenuView:
     searches: int
     listings: int
     watching: int
-    check_minutes: int
+    check_seconds: float
     new_today: int
     job: str | None = None
     queued: int = 0
@@ -63,7 +70,7 @@ def menu(v: MenuView) -> Screen:
     rows = [
         _row("Поисков", f"<b>{v.searches}</b>", SEARCHES),
         _row("Объявлений собрано", f"{v.listings:,}".replace(",", " "), STATS),
-        _row("Слежение", f"{v.watching} · проверка раз в ~{v.check_minutes} мин" if v.watching else "выключено", WATCH),
+        _row("Слежение", f"{v.watching} · проверка раз в {every(v.check_seconds)}" if v.watching else "выключено", WATCH),
         _row("Новых сегодня", str(v.new_today), DATE),
     ]
     if v.route:
@@ -161,13 +168,13 @@ def confirm_delete(what: str, yes: str, back: str) -> Screen:
 # --- watching ---------------------------------------------------------------
 
 WATCH_HELP = (
-    "Раз в ~{minutes} мин смотрю свежие объявления каждого поиска и присылаю сюда те, которых раньше не было: "
+    "Раз в {period} смотрю свежие объявления каждого поиска и сразу присылаю сюда те, которых раньше не было: "
     "по товарам — от частных лиц своего города, по квартирам — от собственников; выставленные за последние "
     "часы, без переопубликованных старых."
 )
 
 
-def watching(items: list[SearchInfo], check_minutes: int) -> Screen:
+def watching(items: list[SearchInfo], check_seconds: float) -> Screen:
     if not items:
         html = (f"<h2>{ce(WATCH)} Слежение</h2><p>Ни за чем не слежу.</p>"
                 "<p>Откройте «Мои поиски», выберите поиск и нажмите «Следить за новыми».</p>")
@@ -175,7 +182,7 @@ def watching(items: list[SearchInfo], check_minutes: int) -> Screen:
     lines = "".join(f'<tr><td align="center">{n}</td><td>{esc(s.title)}</td><td align="center">{s.new_today}</td></tr>'
                     for n, s in enumerate(items, start=1))
     html = (f"<h2>{ce(WATCH)} Слежение · {len(items)}</h2>"
-            f"<p>{esc(WATCH_HELP.format(minutes=check_minutes))}</p>"
+            f"<p>{esc(WATCH_HELP.format(period=every(check_seconds)))}</p>"
             "<table bordered striped compact><tr><th>№</th><th>Поиск</th><th>Новых сегодня</th></tr>"
             f"{lines}</table>")
     rows = [(Button(f"Не следить: {_short(s.title)}", f"stopwatch:{s.name}", icon=WATCH),) for s in items]
@@ -201,14 +208,14 @@ COMMANDS_HELP = (
 )
 
 
-def help_screen(check_minutes: int) -> Screen:
+def help_screen(check_seconds: float) -> Screen:
     commands = "".join(f"<tr><td><code>{esc(c)}</code></td><td>{esc(d)}</td></tr>" for c, d in COMMANDS_HELP)
     html = (f"<h2>{ce(SETTINGS)} Как пользоваться</h2>"
             f"<h4>{ce(STATS)} Собрать объявления</h4>"
             "<p>Пришлите ссылку на поиск Авито — соберу все объявления и пришлю таблицу Excel. "
             "Сбор идёт спокойно, ~30 с на страницу из 50 объявлений, чтобы Авито не блокировал.</p>"
             f"<h4>{ce(WATCH)} Следить за новыми</h4>"
-            f"<p>«Мои поиски» → поиск → «Следить за новыми». {esc(WATCH_HELP.format(minutes=check_minutes))}</p>"
+            f"<p>«Мои поиски» → поиск → «Следить за новыми». {esc(WATCH_HELP.format(period=every(check_seconds)))}</p>"
             f"<h4>{ce(SHIELD)} Капча и блокировки</h4>"
             "<p>Капчу решаю сам. Если Авито временно ограничит доступ, подожду и продолжу — "
             "собранное не теряется, «Собрать» продолжит с той же страницы.</p>"
@@ -238,8 +245,12 @@ def progress(v: ProgressView) -> Screen:
 
 # --- a new listing ----------------------------------------------------------
 
-def alert(profile: str, search: str, a: dict) -> Screen:
-    """A new listing, from the fields avito.Watch passes to ``on_alert``."""
+def alert(profile: str, search: str, a: dict, state: str | None = None) -> Screen:
+    """A new listing, from the fields avito.Watch passes to ``on_alert``.
+
+    ``state``: "checking" while its page is being opened, "republished" when
+    the page shows views from earlier days (an old listing put up again).
+    """
     rows: list[str] = []
     if profile == "realty-owner":
         head = f"🏠 {esc(a['title'])}"
@@ -266,7 +277,14 @@ def alert(profile: str, search: str, a: dict) -> Screen:
         rows.append(_row("В выдаче с", esc(when), DATE))
     if a.get("views"):
         rows.append(_row("Просмотры", esc(a["views"])))
+    elif state == "checking":
+        rows.append(_row("Просмотры", "🔎 проверяю, новое ли…"))
+    if state == "republished":
+        head = f"♻️ Переопубликовано: {head}"
     parts = [f"<h3>{head}</h3>", f"<table compact>{''.join(rows)}</table>"]
+    if state == "republished":
+        parts.append("<blockquote>Старое объявление выставлено заново: у него просмотры с прошлых дней. "
+                     "Скорее всего, неинтересно.</blockquote>")
     if a.get("reasons"):
         parts.append(f"<p>{esc('; '.join(a['reasons']))}</p>")
     if a.get("notes"):

@@ -28,7 +28,8 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ from urllib.parse import urlsplit
 
 import apartments
 import avito_client
+import goods
 import item_page
 import link_resolver
 import profiles
@@ -249,23 +251,27 @@ def write_table(search: Search, seen_before: dict[str, str], *, log: Any = None)
     return path
 
 
-def check_newly_created(client: avito_client.CalmClient, search: Search, fields: dict[str, Any]) -> bool:
+def verify_new(client: avito_client.CalmClient, search: Search, fields: dict[str, Any]) -> bool | None:
     """Open the listing's page: a re-published old listing has views from earlier days.
 
-    Adds the views to ``fields``; returns False for a re-published listing.
-    If the page cannot be read the alert still goes out, marked unchecked.
+    Adds the views (or a note that the page would not open) to ``fields``;
+    True for a newly created listing, False for a re-published one, None if unknown.
     """
     page = item_page.fetch(client, fields["url"], catalog_url=search.catalog_url)
     verdict = item_page.is_newly_created(page) if page else None
     if verdict is None:
         fields["notes"] = [*fields.get("notes", []), "не удалось проверить, новое ли объявление"]
-        return True
+        return None
     fields["views"] = f"{page.total_views} (+{page.today_views} сегодня)"
     if not verdict:
         say("REPUBLISHED", search=search.name, title=fields.get("title"), price=fields.get("price"),
             total_views=page.total_views, today_views=page.today_views, url=fields["url"])
-        return False
-    return True
+    return verdict
+
+
+def check_newly_created(client: avito_client.CalmClient, search: Search, fields: dict[str, Any]) -> bool:
+    """False for a re-published listing; an unreadable page still lets the alert go out, marked unchecked."""
+    return verify_new(client, search, fields) is not False
 
 
 def listed_since(item: dict[str, Any]) -> datetime | None:
@@ -442,6 +448,14 @@ def scan_search(
     return write_table(search, seen_before, log=say_)
 
 
+# A search is about one model when this share of its listings is that model.
+MODEL_SHARE = 0.8
+MODEL_MIN_LISTINGS = 10
+MODEL_FILTER = re.compile(r"^(params\[\d+\])\[0\]$")
+# Parameters of a link that do not change which listings come back.
+NEUTRAL_PARAMS = {"localPriority"}
+
+
 class Watch:
     """One watched search: the listings it has seen and how it judges new ones."""
 
@@ -456,58 +470,176 @@ class Watch:
         self.base = search.load("listings.json")
         self.seen = search.load("seen.json")
         self.profile = profiles.PROFILES[search.profile](self.base, search.home_city, search.alert_sellers)
+        self.model = self._model()
         search.dir.mkdir(parents=True, exist_ok=True)
+
+    def _model(self) -> str | None:
+        """The one model the search is about ("iPhone 15 Pro"), judged from its listings; None if mixed."""
+        if self.search.profile != "goods" or len(self.base) < MODEL_MIN_LISTINGS:
+            return None
+        models = Counter(goods.offer_from_item(item).model for item in self.base.values())
+        model, count = models.most_common(1)[0]
+        return model if count >= MODEL_SHARE * len(self.base) else None
+
+    def merge_keys(self) -> list[tuple[str, tuple[tuple[str, str], ...]]]:
+        """Ways to read this search together with others: (model filter, every other parameter)."""
+        params = self.search.params
+        if self.model is None or self.search.watch_pages != 1:
+            return []
+        keys = []
+        for key in params:
+            match = MODEL_FILTER.match(key)
+            if not match or any(other.startswith(match.group(1)) and other != key for other in params):
+                continue
+            rest = tuple(sorted((k, v) for k, v in params.items()
+                                if not k.startswith(match.group(1)) and k not in NEUTRAL_PARAMS))
+            keys.append((match.group(1), rest))
+        return keys
 
     def check(
         self,
         client: avito_client.CalmClient,
         *,
-        on_alert: Callable[[dict[str, Any]], None] = lambda fields: None,
+        on_alert: Callable[[dict[str, Any]], Any] = lambda fields: None,
         log: Any = None,
+        instant: bool = False,
     ) -> None:
-        """Read the first pages once and alert on listings not seen before.
+        """Read the first pages once and alert on listings not seen before."""
+        items: list[dict[str, Any]] = []
+        for number in range(1, self.search.watch_pages + 1):
+            items += client.page(catalog_url=self.search.catalog_url, params=self.search.request_params,
+                                 number=number).items
+        self.consider(items, client, on_alert=on_alert, log=log, instant=instant)
 
-        The first check only remembers what is already listed: alerts are for
-        listings that appear after watching starts.
+    def consider(
+        self,
+        items: list[dict[str, Any]],
+        client: avito_client.CalmClient,
+        *,
+        on_alert: Callable[[dict[str, Any]], Any] = lambda fields: None,
+        log: Any = None,
+        instant: bool = False,
+    ) -> None:
+        """Take this search's newest listings; alert on those not seen before.
+
+        The first time only remembers what is already listed: alerts are for
+        listings that appear after watching starts. Without ``instant`` a
+        listing's page is opened before the alert to leave out re-published
+        old listings. With it the alert goes out at once; ``on_alert`` may
+        return ``update(fields, verdict)``, called once the page has told
+        whether the listing is new (True), re-published (False) or unknown (None).
         """
         say_ = log or say
         search, base, seen = self.search, self.base, self.seen
         changed = False
         first_pass = not self.primed
         remembered = 0
-        for number in range(1, search.watch_pages + 1):
-            page = client.page(catalog_url=search.catalog_url, params=search.request_params, number=number)
-            stamp = datetime.now().isoformat(timespec="seconds")
-            for item in page.items:
-                key = str(item["id"])
-                if key in seen:
-                    continue
-                seen[key] = stamp
-                base[key] = item
-                changed = True
-                if first_pass:
-                    remembered += 1
-                    continue
-                listed_at = listed_since(item)
-                if not is_fresh(listed_at, search.fresh_hours):
-                    continue
-                fields = self.profile.alert(item)
-                if fields is None:
-                    continue
-                fields = {"search": search.name, **fields}
-                if search.new_only and not check_newly_created(client, search, fields):
-                    continue
-                if listed_at is not None:
-                    fields["listed_at"] = listed_at.strftime("%d.%m %H:%M")
-                with search.path("alerts.jsonl").open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({"found": stamp, **fields}, ensure_ascii=False) + "\n")
-                say_("ALERT", **fields)
-                on_alert(fields)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        for item in items:
+            key = str(item["id"])
+            if key in seen:
+                continue
+            seen[key] = stamp
+            base[key] = item
+            changed = True
+            if first_pass:
+                remembered += 1
+                continue
+            listed_at = listed_since(item)
+            if not is_fresh(listed_at, search.fresh_hours):
+                continue
+            fields = self.profile.alert(item)
+            if fields is None:
+                continue
+            fields = {"search": search.name, **fields}
+            if listed_at is not None:
+                fields["listed_at"] = listed_at.strftime("%d.%m %H:%M")
+            if search.new_only and not instant and not check_newly_created(client, search, fields):
+                continue
+            with search.path("alerts.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"found": stamp, **fields}, ensure_ascii=False) + "\n")
+            say_("ALERT", **fields)
+            update = on_alert(fields)
+            if search.new_only and instant:
+                verdict = verify_new(client, search, fields)
+                if callable(update):
+                    update(fields, verdict)
         if changed:
             search.save_collected(base, seen)
+            if self.model is None:
+                self.model = self._model()
         if first_pass:
             self.primed = True
             say_("PRIMED", search=search.name, remembered=remembered)
+
+
+@dataclass
+class WatchGroup:
+    """Watched searches read with one request.
+
+    Searches that differ only in the model ("iPhone 13", "iPhone 15 Pro", …)
+    are one request with every model chosen in the model filter; each listing
+    goes to the search of its model. A group of one is a plain search.
+    """
+
+    watches: list[Watch]
+    params: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def names(self) -> list[str]:
+        return [watch.search.name for watch in self.watches]
+
+    def check(
+        self,
+        client: avito_client.CalmClient,
+        *,
+        on_alert: Callable[[Search, dict[str, Any]], Any] = lambda search, fields: None,
+        log: Any = None,
+        instant: bool = False,
+    ) -> None:
+        if len(self.watches) == 1:
+            watch = self.watches[0]
+            watch.check(client, on_alert=lambda fields: on_alert(watch.search, fields), log=log, instant=instant)
+            return
+        catalog_url = self.watches[0].search.catalog_url
+        items = list(client.page(catalog_url=catalog_url, params=self.params, number=1).items)
+        full = len(items) >= avito_client.FULL_PAGE_SIZE
+        if full and all(watch.primed for watch in self.watches) and not any(self._seen(item) for item in items):
+            # A whole page of listings not seen before: there may be more since the last look.
+            items += client.page(catalog_url=catalog_url, params=self.params, number=2).items
+        by_model = {watch.model: watch for watch in self.watches}
+        mine: dict[str, list[dict[str, Any]]] = {watch.search.name: [] for watch in self.watches}
+        for item in items:
+            watch = by_model.get(goods.offer_from_item(item).model)
+            if watch is not None:
+                mine[watch.search.name].append(item)
+        for watch in self.watches:
+            watch.consider(mine[watch.search.name], client, log=log, instant=instant,
+                           on_alert=lambda fields, search=watch.search: on_alert(search, fields))
+
+    def _seen(self, item: dict[str, Any]) -> bool:
+        return any(str(item["id"]) in watch.seen for watch in self.watches)
+
+
+def watch_groups(watches: list[Watch]) -> list[WatchGroup]:
+    """The fewest requests that read every watched search (see WatchGroup)."""
+    buckets: dict[Any, list[Watch]] = {}
+    for watch in watches:
+        for key in watch.merge_keys():
+            buckets.setdefault(key, []).append(watch)
+    groups, grouped = [], set()
+    for (model_filter, rest), members in sorted(buckets.items(), key=lambda bucket: -len(bucket[1])):
+        members = [watch for watch in members if watch.search.name not in grouped]
+        models = [watch.model for watch in members]
+        if len(members) < 2 or len(set(models)) < len(models):
+            continue
+        params = dict(rest)
+        for index, watch in enumerate(members):
+            params[f"{model_filter}[{index}]"] = watch.search.params[f"{model_filter}[0]"]
+        groups.append(WatchGroup(members, {**params, **DATE_SORT}))
+        grouped.update(watch.search.name for watch in members)
+    groups += [WatchGroup([watch]) for watch in watches if watch.search.name not in grouped]
+    return groups
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
@@ -665,7 +797,8 @@ def main_cli(argv: list[str] | None = None) -> None:
 
     bot = sub.add_parser("bot", help="принимать команды из Telegram: ссылка → сбор → таблица Excel в чат")
     bot.add_argument("--delay", type=float, default=avito_client.DEFAULT_DELAY_SECONDS)
-    bot.add_argument("--watch-interval", type=float, default=60, help="секунд между проверками новых объявлений")
+    bot.add_argument("--watch-interval", type=float, default=45,
+                     help="секунд между проверками новых объявлений с одного адреса (~80 запросов в час при 45)")
     bot.add_argument("--scan-proxy", help="прокси для сборов, напр. socks5h://127.0.0.1:1080 (SSH-туннель на другой сервер), "
                                          "чтобы сбор не делил лимит запросов со слежением")
     bot.set_defaults(func=cmd_bot)
