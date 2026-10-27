@@ -14,11 +14,13 @@ the bot keeps answering while a scan walks Avito at its calm pace. Watched
 searches are checked about once a minute in a thread of their own: the first
 page of each, new listings sent to the chat. The watch list survives restarts.
 
-Avito limits requests per IP address. Watch checks leave from this server;
-jobs leave through ``--scan-proxy`` (an SSH tunnel to another server,
-SSH-TUNNEL.md), so both run at full pace without waiting for each other.
-If the proxy is down or blocked, jobs fall back to this server's address
-and share its pace with the checks (avito_client.Pacer) until it is retried.
+Avito limits requests per IP address, so the load is spread over two:
+this server's and, through ``--scan-proxy`` (an SSH tunnel, SSH-TUNNEL.md),
+a second server's. Jobs go through the second one; watch checks take turns
+between both. Each address has one pace of requests (avito_client.Pacer)
+that everything leaving through it shares. An address Avito turns away is
+rested for a while and the checks carry on through the other one; if the
+proxy is down altogether, jobs and checks use this server's address alone.
 Both threads add to a search's stored listings (Search.save_collected).
 """
 
@@ -135,6 +137,10 @@ def new_today(name: str) -> int:
     return sum(line.startswith(f'{{"found": "{today}') for line in lines)
 
 
+class AddressRested(Exception):
+    """Avito turned a watch check's address away: rest it instead of waiting inside the client."""
+
+
 class ProxyFailed(avito.ScanStopped):
     """The job's proxy went down or got blocked: stop, then go on without it."""
 
@@ -227,16 +233,18 @@ class Bot:
         self.watch_due = 0.0  # time.monotonic() of the next watch cycle
         self.announce: set[str] = set()  # newly watched: tell when the current listings are remembered
         self.reload_watches = threading.Event()  # a job stored listings the watches have not seen
-        # This server's address: watch checks always, jobs only when the proxy is out.
+        # One pace per address: this server's, and the second server's behind the proxy.
         self.pacer = avito_client.Pacer(delay)
+        self.proxy_pacer = avito_client.Pacer(delay)
         self.scan_proxy = scan_proxy
         self.proxy_off_until = 0.0
+        self.rested_until = {False: 0.0, True: 0.0}  # by "through the proxy": a turned-away address rests
         # Job thread only:
         self._job_clients: dict[bool, avito_client.CalmClient] = {}
         # Watch thread only:
         self.watches: dict[str, avito.Watch] = {}
         self.failures: dict[str, int] = {}
-        self.watch_client: avito_client.CalmClient | None = None
+        self.watch_clients: dict[bool, avito_client.CalmClient] = {}
         self.cycles = 0
 
     # --- sending ---------------------------------------------------------
@@ -271,7 +279,8 @@ class Bot:
     @property
     def check_minutes(self) -> int:
         """How often each watched search is looked at: the interval, or longer with many searches."""
-        cycle = max(self.watch_interval, len(self.watching) * self.delay)
+        addresses = 2 if self.proxy_usable() else 1
+        cycle = max(self.watch_interval, math.ceil(len(self.watching) / addresses) * self.delay)
         return max(1, round(cycle / 60))
 
     def info(self, name: str) -> screens.SearchInfo:
@@ -551,7 +560,7 @@ class Bot:
             via_proxy = False
         if via_proxy not in self._job_clients:
             self._job_clients[via_proxy] = (
-                avito_client.CalmClient(delay=self.delay, proxy=self.scan_proxy) if via_proxy
+                avito_client.CalmClient(proxy=self.scan_proxy, pacer=self.proxy_pacer) if via_proxy
                 else avito_client.CalmClient(pacer=self.pacer)  # this server's address: share its pace
             )
         return self._job_clients[via_proxy], via_proxy
@@ -636,10 +645,30 @@ class Bot:
             else:
                 time.sleep(1)
 
+    def watch_addresses(self) -> list[bool]:
+        """The addresses checks may use now (True: the second server's), turned-away ones resting."""
+        now = time.monotonic()
+        addresses = [] if now < self.rested_until[False] else [False]
+        if self.proxy_usable() and now >= self.rested_until[True] and proxy_reachable(self.scan_proxy):
+            addresses.append(True)
+        return addresses
+
+    def watch_client(self, via_proxy: bool) -> avito_client.CalmClient:
+        if via_proxy not in self.watch_clients:
+            self.watch_clients[via_proxy] = avito_client.CalmClient(
+                log=self.watch_log, pacer=self.proxy_pacer if via_proxy else self.pacer,
+                proxy=self.scan_proxy if via_proxy else None,
+            )
+        return self.watch_clients[via_proxy]
+
+    @staticmethod
+    def watch_log(kind: str, **fields: Any) -> None:
+        avito.say(kind, **fields)
+        if kind in ("IP-BLOCK", "NETWORK-WAIT"):
+            raise AddressRested(kind)  # not the client's 10-minute wait: the other address goes on
+
     def watch_cycle(self) -> None:
-        """Check every watched search once."""
-        if self.watch_client is None:
-            self.watch_client = avito_client.CalmClient(log=avito.say, pacer=self.pacer)
+        """Check every watched search once, taking turns between the addresses."""
         if self.reload_watches.is_set():
             self.reload_watches.clear()
             for watch in self.watches.values():
@@ -650,13 +679,20 @@ class Bot:
             names = sorted(self.watching)
         for name in set(self.watches) - set(names):
             del self.watches[name]
+        turn = 0
         for name in names:
-            if name in self.watching:  # not unwatched or deleted meanwhile
-                self.check_one(name)
+            if name not in self.watching:  # unwatched or deleted meanwhile
+                continue
+            addresses = self.watch_addresses()
+            if not addresses:  # both turned away: wait for the first to rest
+                self.watch_due = min(self.rested_until.values())
+                return
+            self.check_one(name, addresses[turn % len(addresses)])
+            turn += 1
         # Counted from the start: with many searches the checks simply run back to back.
         self.watch_due = started + self.watch_interval * random.uniform(0.9, 1.1)
 
-    def check_one(self, name: str) -> None:
+    def check_one(self, name: str, via_proxy: bool = False) -> None:
         watch = self.watches.get(name)
         if watch is None:
             try:
@@ -670,11 +706,17 @@ class Bot:
             watch.profile.refresh_market()
         search = watch.search
         try:
-            watch.check(self.watch_client, on_alert=lambda fields: self.alert(search, fields))
+            watch.check(self.watch_client(via_proxy), on_alert=lambda fields: self.alert(search, fields))
             self.failures[name] = 0
+        except AddressRested:
+            self.rested_until[via_proxy] = time.monotonic() + avito_client.IP_BLOCK_WAIT_SECONDS
+            avito.say("BOT", text=f"{'второй сервер' if via_proxy else 'этот сервер'}: Авито не пускает, "
+                                  f"отдыхает {avito_client.IP_BLOCK_WAIT_SECONDS // 60} мин, проверки идут через другой")
+            watch.reload()  # forget what this half-done check marked as seen: the next check alerts on it
         except (RuntimeError, ValueError, *avito_client.TRANSPORT_ERRORS) as exc:
             error = f"{type(exc).__name__}: {exc}"[:300]
             avito.say("ERROR", search=name, error=error)
+            watch.reload()
             self.failures[name] = self.failures.get(name, 0) + 1
             if self.failures[name] == WATCH_FAILURES_TO_REPORT:
                 self.say(f"⚠️ Не получается проверить «{esc(search.title)}» ({esc(error)}). Продолжаю пробовать.")
